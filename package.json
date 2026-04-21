@@ -1,0 +1,11 @@
+{
+  "name": "pi-ancestor-agentsmd",
+  "private": true,
+  "type": "module",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "test": "bun test tests/*.test.ts"
+  }
+}
