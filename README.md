@@ -6,7 +6,11 @@ This package fills that gap.
 
 It is inspired by OpenCode's instruction-file resolution model: when a file is read, instruction files closer to that file should win over broader project-level ones. OpenCode applies that idea to instruction files such as `AGENTS.md` and `CLAUDE.md`. This package brings the same general behavior to pi for `AGENTS.md`.
 
+Beyond AGENTS.md, the package also supports [DESIGN.md](https://designmd.ai/what-is-design-md) — the Google Stitch open-source design system format. Two opt-in environment variables enable injecting DESIGN.md into the agent's context, either at startup (root file) or dynamically via ancestor walking.
+
 ## What it does
+
+### AGENTS.md
 
 When pi reads a file below the session root, this extension prepends ancestor `AGENTS.md` files to the `read` result before the file content.
 
@@ -27,12 +31,32 @@ A few rules keep that behavior sane:
 
 - deeper directories come first
 - the session root `AGENTS.md` is not re-added, because pi already loaded it at startup
-- each injected `AGENTS.md` is only added once per session
-- `--no-context-files` disables the feature entirely
+- each injected file is only added once per session
+- `--no-context-files` disables the entire extension
+
+### DESIGN.md (opt-in via env vars)
+
+Root injection — appends `cwd/DESIGN.md` content to the system prompt before the first LLM call.
+Ancestor injection — walks ancestor directories for `DESIGN.md` files (same hierarchy rules as AGENTS.md).
+
+Both are disabled by default. Enable via:
+
+```bash
+# Inject root cwd/DESIGN.md into system prompt at session start
+PI_ROOT_DESIGN_MD=1
+
+# Walk ancestor dirs for DESIGN.md on file reads
+PI_ANCESTOR_DESIGN_MD=1
+
+# Both work independently and can be combined
+PI_ROOT_DESIGN_MD=1 PI_ANCESTOR_DESIGN_MD=1
+```
+
+Root DESIGN.md is injected via the `before_agent_start` event — no file read is needed. The model sees it from the very first turn. Ancestor DESIGN.md follows the same walk-up rules as AGENTS.md (deeper first, skip root, dedup'd per session).
 
 ## What it looks like in pi
 
-This package does not create a separate visible `read AGENTS.md` tool call.
+This package does not create a separate visible `read AGENTS.md` or `read DESIGN.md` tool call.
 
 In the TUI you still see a normal row such as:
 
@@ -40,13 +64,29 @@ In the TUI you still see a normal row such as:
 read frontend/package.json
 ```
 
-The injected `AGENTS.md` content appears inside that read result, above the file content.
+The injected content appears inside that read result, above the file content. Root DESIGN.md content appears in the system prompt — no TUI-visible tool call at all.
 
 ## Why it is implemented this way
 
 This package does not override pi's `read` tool.
 
 Instead, it patches `read` results in `tool_result`. That keeps it compatible with extensions that also customize `read`, while preserving normal `read` semantics such as `offset` and `limit`.
+
+For root DESIGN.md injection, it hooks `before_agent_start` and appends to the system prompt — no file read, no visible tool call, no token waste.
+
+## Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PI_ROOT_DESIGN_MD` | `0` | Inject `cwd/DESIGN.md` into system prompt at startup |
+| `PI_ANCESTOR_DESIGN_MD` | `0` | Inject ancestor `DESIGN.md` files on file reads |
+| `PI_ANCESTOR_AGENTS_MD` | `1` | Inject ancestor `AGENTS.md` files on file reads (set to `0` to disable) |
+
+## CLI flags
+
+| Flag | Effect |
+|------|--------|
+| `--no-context-files`, `-nc` | Disables the entire extension (AGENTS.md + DESIGN.md both) |
 
 ## Install
 
@@ -64,21 +104,16 @@ bun test tests/*.test.ts
 ## Layout
 
 - `src/index.ts` — extension entrypoint
-- `src/core.ts` — helper logic
-- `tests/core.test.ts` — unit tests
+- `src/core.ts` — helper logic including DESIGN.md env var guards
+- `tests/core.test.ts` — unit tests for AGENTS.md and DESIGN.md
 
 ## Compatibility
 
 This package was refactored to avoid owning the `read` tool, so it can coexist with extensions such as `pi-multi-modal` that also customize read behavior.
 
-## Package-style loading
+Root DESIGN.md injection uses `before_agent_start` (not tool ownership), so it does not conflict with other extensions.
 
-The package uses a `package.json` pi manifest:
+## License
 
-```json
-{
-  "pi": {
-    "extensions": ["./src/index.ts"]
-  }
-}
-```
+MIT
+
