@@ -1,6 +1,7 @@
 import path from "node:path";
 import { describe, expect, test, beforeAll } from "bun:test";
 import {
+	collectRecursive,
 	collectRecursiveAgents,
 	collectRecursiveDesign,
 	hasNoContextFilesFlag,
@@ -8,7 +9,8 @@ import {
 	isAncestorDesignMdEnabled,
 	isAncestorAgentsMdEnabled,
 	prependAgentsContent,
-} from "../src/core";
+	truncateForContext,
+} from "../src/core.js";
 
 describe("hasNoContextFilesFlag", () => {
 	test("detects long and short flags", () => {
@@ -60,7 +62,7 @@ describe("env var guards", () => {
 });
 
 describe("collectRecursiveAgents", () => {
-	test("collects nested AGENTS from deepest to highest and skips cwd root", async () => {
+	test("collects nested AGENTS from closest to broadest and skips cwd root", async () => {
 		const cwd = "/repo";
 		const map = new Map([
 			[path.resolve("/repo/nested/deeper/AGENTS.md"), "deep rules\n"],
@@ -71,12 +73,12 @@ describe("collectRecursiveAgents", () => {
 		const results = await collectRecursiveAgents("nested/deeper/file.ts", cwd, async (filepath) => map.get(filepath) ?? "");
 
 		expect(results).toEqual([
-			{ filepath: path.resolve("/repo/nested/deeper/AGENTS.md"), content: "deep rules\n" },
-			{ filepath: path.resolve("/repo/nested/AGENTS.md"), content: "nested rules\n" },
+			expect.objectContaining({ filepath: path.resolve("/repo/nested/deeper/AGENTS.md"), content: "deep rules\n" }),
+			expect.objectContaining({ filepath: path.resolve("/repo/nested/AGENTS.md"), content: "nested rules\n" }),
 		]);
 	});
 
-		test("skips the target AGENTS file itself", async () => {
+	test("skips the target AGENTS file itself", async () => {
 		const cwd = "/repo";
 		const map = new Map([
 			[path.resolve("/repo/nested/AGENTS.md"), "nested rules\n"],
@@ -85,7 +87,9 @@ describe("collectRecursiveAgents", () => {
 
 		const results = await collectRecursiveAgents("nested/deeper/AGENTS.md", cwd, async (filepath) => map.get(filepath) ?? "");
 
-		expect(results).toEqual([{ filepath: path.resolve("/repo/nested/AGENTS.md"), content: "nested rules\n" }]);
+		expect(results).toEqual([
+			expect.objectContaining({ filepath: path.resolve("/repo/nested/AGENTS.md"), content: "nested rules\n" }),
+		]);
 	});
 
 	test("ignores targets outside cwd", async () => {
@@ -94,8 +98,35 @@ describe("collectRecursiveAgents", () => {
 	});
 });
 
+describe("collectRecursive limits", () => {
+	test("truncates without splitting multi-byte characters", () => {
+		const result = truncateForContext("ab😀cd", 5, "/repo/AGENTS.md");
+
+		expect(result.truncated).toBe(true);
+		expect(result.content).toStartWith("ab");
+		expect(result.content).not.toContain("�");
+		expect(result.content).toContain("please read the file directly: /repo/AGENTS.md");
+	});
+
+	test("honors the total per-read byte budget across multiple files", async () => {
+		const cwd = "/repo";
+		const map = new Map([
+			[path.resolve("/repo/a/AGENTS.md"), "12345"],
+			[path.resolve("/repo/a/b/AGENTS.md"), "67890"],
+		]);
+
+		const results = await collectRecursive("a/b/file.ts", cwd, async (filepath) => map.get(filepath) ?? "", {
+			filenames: ["AGENTS.md"],
+			maxBytesPerFile: 5,
+			maxBytesPerRead: 5,
+		});
+
+		expect(results).toEqual([expect.objectContaining({ filepath: path.resolve("/repo/a/b/AGENTS.md") })]);
+	});
+});
+
 describe("collectRecursiveDesign", () => {
-	test("collects nested DESIGN.md from deepest to highest and skips cwd root", async () => {
+	test("collects nested DESIGN.md from closest to broadest and skips cwd root", async () => {
 		const cwd = "/repo";
 		const map = new Map([
 			[path.resolve("/repo/nested/deeper/DESIGN.md"), "deep design\n"],
@@ -106,8 +137,8 @@ describe("collectRecursiveDesign", () => {
 		const results = await collectRecursiveDesign("nested/deeper/file.ts", cwd, async (filepath) => map.get(filepath) ?? "");
 
 		expect(results).toEqual([
-			{ filepath: path.resolve("/repo/nested/deeper/DESIGN.md"), content: "deep design\n" },
-			{ filepath: path.resolve("/repo/nested/DESIGN.md"), content: "nested design\n" },
+			expect.objectContaining({ filepath: path.resolve("/repo/nested/deeper/DESIGN.md"), content: "deep design\n" }),
+			expect.objectContaining({ filepath: path.resolve("/repo/nested/DESIGN.md"), content: "nested design\n" }),
 		]);
 	});
 
@@ -120,7 +151,9 @@ describe("collectRecursiveDesign", () => {
 
 		const results = await collectRecursiveDesign("nested/deeper/DESIGN.md", cwd, async (filepath) => map.get(filepath) ?? "");
 
-		expect(results).toEqual([{ filepath: path.resolve("/repo/nested/DESIGN.md"), content: "nested design\n" }]);
+		expect(results).toEqual([
+			expect.objectContaining({ filepath: path.resolve("/repo/nested/DESIGN.md"), content: "nested design\n" }),
+		]);
 	});
 
 	test("collects both DESIGN.md and AGENTS.md when root dirs have only one type each", async () => {
@@ -131,7 +164,9 @@ describe("collectRecursiveDesign", () => {
 		]);
 
 		const designResults = await collectRecursiveDesign("sub/file.ts", cwd, async (filepath) => map.get(filepath) ?? "");
-		expect(designResults).toEqual([{ filepath: path.resolve("/repo/sub/DESIGN.md"), content: "sub design\n" }]);
+		expect(designResults).toEqual([
+			expect.objectContaining({ filepath: path.resolve("/repo/sub/DESIGN.md"), content: "sub design\n" }),
+		]);
 
 		const agentsResults = await collectRecursiveAgents("sub/file.ts", cwd, async (filepath) => map.get(filepath) ?? "");
 		expect(agentsResults).toEqual([]);
@@ -161,7 +196,7 @@ describe("prependAgentsContent", () => {
 			],
 			changed: true,
 		});
-		
+
 		expect(loadedPaths).toEqual(
 			new Set([path.resolve("/repo/nested/AGENTS.md"), path.resolve("/repo/nested/deeper/AGENTS.md")]),
 		);

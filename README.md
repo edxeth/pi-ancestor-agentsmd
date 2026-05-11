@@ -20,7 +20,7 @@ If pi reads:
 frontend/src/components/Button.tsx
 ```
 
-then the model sees content in this order:
+then the model sees injected context before the file content, ordered from closest nested file to broadest nested file:
 
 1. `frontend/src/components/AGENTS.md` if present
 2. `frontend/src/AGENTS.md` if present
@@ -29,9 +29,11 @@ then the model sees content in this order:
 
 A few rules keep that behavior sane:
 
-- deeper directories come first
+- closer directories come first, matching OpenCode's nearby-instruction order
 - the session root `AGENTS.md` is not re-added, because pi already loaded it at startup
-- each injected file is only added once per session
+- each injected file is only added once per session, then becomes eligible again after compaction/restart
+- symlink escapes outside the session root are rejected
+- large context files are truncated safely
 - `--no-context-files` disables the entire extension
 
 ### DESIGN.md (opt-in via env vars)
@@ -52,7 +54,7 @@ PI_ANCESTOR_DESIGN_MD=1
 PI_ROOT_DESIGN_MD=1 PI_ANCESTOR_DESIGN_MD=1
 ```
 
-Root DESIGN.md is injected via the `before_agent_start` event — no file read is needed. The model sees it from the very first turn. Ancestor DESIGN.md follows the same walk-up rules as AGENTS.md (deeper first, skip root, dedup'd per session).
+Root DESIGN.md is injected via the `before_agent_start` event — no file read is needed. The model sees it from the very first turn. Ancestor DESIGN.md follows the same walk-up rules as AGENTS.md (closest first, skip root, dedup'd per session).
 
 ## What it looks like in pi
 
@@ -88,6 +90,12 @@ For root DESIGN.md injection, it hooks `before_agent_start` and appends to the s
 |------|--------|
 | `--no-context-files`, `-nc` | Disables the entire extension (AGENTS.md + DESIGN.md both) |
 
+## Slash commands
+
+| Command | Effect |
+|---------|--------|
+| `/nested-context-files` | Writes a debug session entry listing injected `AGENTS.md` and `DESIGN.md` files |
+
 ## Install
 
 ```bash
@@ -100,18 +108,6 @@ pi install git:github.com/edxeth/pi-ancestor-agentsmd
 cd ~/.pi/agent/extensions/pi-ancestor-agentsmd
 bun test tests/*.test.ts
 ```
-
-## Layout
-
-- `src/index.ts` — extension entrypoint
-- `src/core.ts` — helper logic including DESIGN.md env var guards
-- `tests/core.test.ts` — unit tests for AGENTS.md and DESIGN.md
-
-## Compatibility
-
-This package was refactored to avoid owning the `read` tool, so it can coexist with extensions such as `pi-multi-modal` that also customize read behavior.
-
-Root DESIGN.md injection uses `before_agent_start` (not tool ownership), so it does not conflict with other extensions.
 
 ## License
 

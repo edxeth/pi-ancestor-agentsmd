@@ -7,6 +7,14 @@
     "extensions": ["./src/index.ts"]
   },
   "scripts": {
-    "test": "bun test tests/*.test.ts"
+    "test": "bun test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "tsc --noEmit && bun test tests/*.test.ts"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@types/node": "^25.6.2",
+    "bun-types": "^1.3.13",
+    "typescript": "^6.0.3"
   }
 }
