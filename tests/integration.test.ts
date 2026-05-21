@@ -2,13 +2,13 @@ import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, mock, test } from "bun:test";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 function hasToolName(event: unknown): event is { toolName: string } {
 	return typeof event === "object" && event !== null && "toolName" in event;
 }
 
-mock.module("@mariozechner/pi-coding-agent", () => ({
+mock.module("@earendil-works/pi-coding-agent", () => ({
 	isReadToolResult: (event: unknown) => hasToolName(event) && event.toolName === "read",
 }));
 

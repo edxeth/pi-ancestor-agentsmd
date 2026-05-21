@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { isReadToolResult, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { isReadToolResult, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	collectRecursiveAgents,
 	collectRecursiveDesign,
