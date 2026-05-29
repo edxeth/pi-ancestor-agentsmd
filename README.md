@@ -1,5 +1,14 @@
 # pi-ancestor-agentsmd
 
+## 🌐 **Join the Community**
+
+> [!NOTE]
+> **Building with AI doesn’t have to be a solo grind.**  
+> Join our Discord community to meet other people exploring the latest models, tools, workflows, and ideas: **https://discord.gg/whhrDtCrSS**
+>
+> We talk about what’s new, what’s useful, and what’s actually worth paying attention to in AI.  
+> *And if you want more than conversation,* members also get access to **heavily discounted AI products and services** — including deals on tools like **ChatGPT Plus** and more for just a few dollars.
+
 Pi already loads `AGENTS.md` at startup from the current working directory and its parent directories. That covers project-level guidance, but it misses a common case in larger repos: the agent starts at the root, then later reads files inside a more specific area like `frontend/` or `docs/`, where another `AGENTS.md` exists.
 
 This package fills that gap.
