@@ -16,13 +16,23 @@ import {
 const COMMAND_CONTEXT_FILES = "nested-context-files";
 const FLAG_NO_CONTEXT_FILES = "no-context-files";
 const ENTRY_CONTEXT_FILES_DEBUG = "ancestor-agentsmd:context-files";
+const ENTRY_CONTEXT_FILE_EVENT = "ancestor-agentsmd:context-file-event";
 const SINGLETON_SESSION_KEY = "__pi_ancestor_agentsmd_singleton__";
+
+type InjectedFileRecord = {
+	filepath: string;
+	type: "AGENTS.md" | "DESIGN.md";
+	truncated: boolean;
+	mode: "read-tool-result" | "system-prompt";
+	injectionCount: number;
+	lastTurn?: number;
+};
 
 type SessionState = {
 	loadedAgentsPaths: Set<string>;
 	loadedDesignPaths: Set<string>;
-	injectedFiles: Map<string, { filepath: string; type: "AGENTS.md" | "DESIGN.md"; truncated: boolean }>;
-	rootDesignInjected: boolean;
+	injectedFiles: Map<string, InjectedFileRecord>;
+	agentStartCount: number;
 };
 
 const sessions = new Map<string, SessionState>();
@@ -49,7 +59,7 @@ function getSessionState(sessionKey: string) {
 			loadedAgentsPaths: new Set<string>(),
 			loadedDesignPaths: new Set<string>(),
 			injectedFiles: new Map(),
-			rootDesignInjected: false,
+			agentStartCount: 0,
 		};
 		sessions.set(sessionKey, state);
 	}
@@ -73,8 +83,23 @@ function rememberInjectedFiles(
 			filepath: resolved,
 			type,
 			truncated: file.truncated === true,
+			mode: "read-tool-result",
+			injectionCount: 1,
 		});
 	}
+}
+
+function rememberRootDesignInjection(state: SessionState, filepath: string) {
+	const resolved = path.resolve(filepath);
+	const current = state.injectedFiles.get(resolved);
+	state.injectedFiles.set(resolved, {
+		filepath: resolved,
+		type: "DESIGN.md",
+		truncated: false,
+		mode: "system-prompt",
+		injectionCount: (current?.injectionCount ?? 0) + 1,
+		lastTurn: state.agentStartCount,
+	});
 }
 
 function appendDebugEntry(pi: ExtensionAPI, sessionKey: string, state: SessionState) {
@@ -82,6 +107,16 @@ function appendDebugEntry(pi: ExtensionAPI, sessionKey: string, state: SessionSt
 		sessionKey,
 		count: state.injectedFiles.size,
 		files: [...state.injectedFiles.values()],
+	});
+}
+
+function appendRootDesignInjectionEvent(pi: ExtensionAPI, sessionKey: string, state: SessionState, filepath: string) {
+	pi.appendEntry?.(ENTRY_CONTEXT_FILE_EVENT, {
+		sessionKey,
+		type: "root-design-md",
+		path: path.resolve(filepath),
+		mode: "system-prompt",
+		turn: state.agentStartCount,
 	});
 }
 
@@ -110,12 +145,12 @@ export default function (pi: ExtensionAPI) {
 		clearSession(getSessionKey(ctx));
 	});
 
-	// Root DESIGN.md injection: before first LLM call, append to system prompt.
+	// Root DESIGN.md injection: append to every agent-start system prompt.
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (disabled || !isRootDesignMdEnabled()) return;
 		const sessionKey = getSessionKey(ctx);
 		const state = getSessionState(sessionKey);
-		if (state.rootDesignInjected) return;
+		state.agentStartCount += 1;
 
 		const contained = await resolveContainedPath("DESIGN.md", sessionRoot);
 		if (!contained) return;
@@ -124,7 +159,8 @@ export default function (pi: ExtensionAPI) {
 		const content = await readFileContent(designPath);
 		if (!content) return;
 
-		state.rootDesignInjected = true;
+		rememberRootDesignInjection(state, designPath);
+		appendRootDesignInjectionEvent(pi, sessionKey, state, designPath);
 		return {
 			systemPrompt: event.systemPrompt + `\n\n## ${designPath}\n\n${content}\n\n`,
 		};

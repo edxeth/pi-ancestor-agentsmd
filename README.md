@@ -47,13 +47,13 @@ A few rules keep that behavior sane:
 
 ### DESIGN.md (opt-in via env vars)
 
-Root injection — appends `cwd/DESIGN.md` content to the system prompt before the first LLM call.
+Root injection — appends `cwd/DESIGN.md` content to the system prompt before every agent start when enabled.
 Ancestor injection — walks ancestor directories for `DESIGN.md` files (same hierarchy rules as AGENTS.md).
 
 Both are disabled by default. Enable via:
 
 ```bash
-# Inject root cwd/DESIGN.md into system prompt at session start
+# Inject root cwd/DESIGN.md into each agent-start system prompt
 PI_ROOT_DESIGN_MD=1
 
 # Walk ancestor dirs for DESIGN.md on file reads
@@ -63,7 +63,7 @@ PI_ANCESTOR_DESIGN_MD=1
 PI_ROOT_DESIGN_MD=1 PI_ANCESTOR_DESIGN_MD=1
 ```
 
-Root DESIGN.md is injected via the `before_agent_start` event — no file read is needed. The model sees it from the very first turn. Ancestor DESIGN.md follows the same walk-up rules as AGENTS.md (closest first, skip root, dedup'd per session).
+Root DESIGN.md is injected via the `before_agent_start` event — no user-visible `read` tool call is needed. The model sees it on the first turn and on later user prompts. Ancestor DESIGN.md follows the same walk-up rules as AGENTS.md (closest first, skip root, dedup'd per session).
 
 ## What it looks like in pi
 
@@ -75,7 +75,7 @@ In the TUI you still see a normal row such as:
 read frontend/package.json
 ```
 
-The injected content appears inside that read result, above the file content. Root DESIGN.md content appears in the system prompt — no TUI-visible tool call at all.
+The injected content appears inside that read result, above the file content. Root DESIGN.md content appears in the system prompt — no TUI-visible tool call at all. Each root injection is also recorded as an `ancestor-agentsmd:context-file-event` custom session entry.
 
 ## Why it is implemented this way
 
@@ -83,13 +83,13 @@ This package does not override pi's `read` tool.
 
 Instead, it patches `read` results in `tool_result`. That keeps it compatible with extensions that also customize `read`, while preserving normal `read` semantics such as `offset` and `limit`.
 
-For root DESIGN.md injection, it hooks `before_agent_start` and appends to the system prompt — no file read, no visible tool call, no token waste.
+For root DESIGN.md injection, it hooks `before_agent_start` and appends to the system prompt. This makes the design system available on every user prompt, at the cost of including the root `DESIGN.md` tokens in each agent-start request.
 
 ## Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PI_ROOT_DESIGN_MD` | `0` | Inject `cwd/DESIGN.md` into system prompt at startup |
+| `PI_ROOT_DESIGN_MD` | `0` | Inject `cwd/DESIGN.md` into each agent-start system prompt |
 | `PI_ANCESTOR_DESIGN_MD` | `0` | Inject ancestor `DESIGN.md` files on file reads |
 | `PI_ANCESTOR_AGENTS_MD` | `1` | Inject ancestor `AGENTS.md` files on file reads (set to `0` to disable) |
 
@@ -103,7 +103,7 @@ For root DESIGN.md injection, it hooks `before_agent_start` and appends to the s
 
 | Command | Effect |
 |---------|--------|
-| `/nested-context-files` | Writes a debug session entry listing injected `AGENTS.md` and `DESIGN.md` files |
+| `/nested-context-files` | Writes a debug session entry listing injected `AGENTS.md` and `DESIGN.md` files, including root system-prompt injections |
 
 ## Install
 

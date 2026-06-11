@@ -213,6 +213,62 @@ describe("extension integration", () => {
 		}
 	});
 
+	test("injects root DESIGN.md into every agent start and records debug state", async () => {
+		const previous = process.env.PI_ROOT_DESIGN_MD;
+		process.env.PI_ROOT_DESIGN_MD = "1";
+		const tree = await makeTree({ "DESIGN.md": "DESIGN_SENTINEL_ROOT_INJECTION_2026_06_11" });
+		try {
+			const extension = await loadExtension();
+			const fake = makeFakePi(tree.root, { sessionFile: "/tmp/root-design.jsonl" });
+			extension(fake.pi as unknown as ExtensionAPI);
+			await fake.emit("session_start", {});
+
+			const first = await fake.emit("before_agent_start", { systemPrompt: "base prompt" });
+			const second = await fake.emit("before_agent_start", { systemPrompt: "next prompt" });
+			await fake.runCommand("nested-context-files");
+
+			expect(first).toMatchObject({
+				systemPrompt: expect.stringContaining("DESIGN_SENTINEL_ROOT_INJECTION_2026_06_11"),
+			});
+			expect(second).toMatchObject({
+				systemPrompt: expect.stringContaining("DESIGN_SENTINEL_ROOT_INJECTION_2026_06_11"),
+			});
+			expect(fake.entries.filter((entry) => entry.type === "ancestor-agentsmd:context-file-event")).toEqual([
+				expect.objectContaining({
+					data: expect.objectContaining({
+						type: "root-design-md",
+						path: tree.path("DESIGN.md"),
+						mode: "system-prompt",
+						turn: 1,
+					}),
+				}),
+				expect.objectContaining({
+					data: expect.objectContaining({ turn: 2 }),
+				}),
+			]);
+			expect(lastEntry(fake.entries)?.type).toBe("ancestor-agentsmd:context-files");
+			expect(lastEntry(fake.entries)?.data).toMatchObject({
+				count: 1,
+				files: [
+					expect.objectContaining({
+						filepath: tree.path("DESIGN.md"),
+						type: "DESIGN.md",
+						mode: "system-prompt",
+						injectionCount: 2,
+						lastTurn: 2,
+					}),
+				],
+			});
+		} finally {
+			if (previous === undefined) {
+				delete process.env.PI_ROOT_DESIGN_MD;
+			} else {
+				process.env.PI_ROOT_DESIGN_MD = previous;
+			}
+			await tree.cleanup();
+		}
+	});
+
 	test("registers --no-context-files and /nested-context-files debug command", async () => {
 		const tree = await makeTree({ "src/AGENTS.md": "src rules", "src/file.ts": "x" });
 		try {
@@ -226,6 +282,9 @@ describe("extension integration", () => {
 			expect(fake.registeredFlags).toContain("no-context-files");
 			expect(lastEntry(fake.entries)?.type).toBe("ancestor-agentsmd:context-files");
 			expect(lastEntry(fake.entries)?.data).toMatchObject({ count: 1 });
+			expect(lastEntry(fake.entries)?.data).toMatchObject({
+				files: [expect.objectContaining({ mode: "read-tool-result", injectionCount: 1 })],
+			});
 		} finally {
 			await tree.cleanup();
 		}
