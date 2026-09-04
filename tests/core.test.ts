@@ -1,6 +1,9 @@
+import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, test, beforeAll } from "bun:test";
 import {
+	collectNestedAgentsDirs,
 	collectRecursive,
 	collectRecursiveAgents,
 	collectRecursiveDesign,
@@ -8,7 +11,9 @@ import {
 	isRootDesignMdEnabled,
 	isAncestorDesignMdEnabled,
 	isAncestorAgentsMdEnabled,
+	isNestedAgentsManifestEnabled,
 	prependAgentsContent,
+	resolveContainedPath,
 	truncateForContext,
 } from "../src/core.js";
 
@@ -59,9 +64,124 @@ describe("env var guards", () => {
 		expect(isAncestorAgentsMdEnabled()).toBe(true);
 		delete process.env.PI_ANCESTOR_AGENTS_MD;
 	});
+
+	test("PI_NESTED_AGENTS_MANIFEST defaults to enabled", () => {
+		delete process.env.PI_NESTED_AGENTS_MANIFEST;
+		expect(isNestedAgentsManifestEnabled()).toBe(true);
+	});
+
+	test("PI_NESTED_AGENTS_MANIFEST=0 disables the manifest", () => {
+		process.env.PI_NESTED_AGENTS_MANIFEST = "0";
+		expect(isNestedAgentsManifestEnabled()).toBe(false);
+		delete process.env.PI_NESTED_AGENTS_MANIFEST;
+	});
+});
+
+describe("collectNestedAgentsDirs", () => {
+	test("returns bounded breadth-first relative paths and skips excluded directories", async () => {
+		const root = await realpath(await mkdtemp(path.join(tmpdir(), "paa-core-")));
+		try {
+			for (const relative of [
+				"AGENTS.md",
+				"alpha/AGENTS.md",
+				"alpha/deep/AGENTS.md",
+				"alpha/deep/deeper/AGENTS.md",
+				"beta/AGENTS.md",
+				"beta/deep/AGENTS.md",
+				"gamma/AGENTS.md",
+				".hidden/AGENTS.md",
+				"node_modules/pkg/AGENTS.md",
+			]) {
+				const filepath = path.join(root, relative);
+				await mkdir(path.dirname(filepath), { recursive: true });
+				await writeFile(filepath, relative, "utf8");
+			}
+			await mkdir(path.join(root, "empty"), { recursive: true });
+
+			expect(await collectNestedAgentsDirs(root)).toEqual([
+				"alpha",
+				"beta",
+				"gamma",
+				"alpha/deep",
+				"beta/deep",
+				"alpha/deep/deeper",
+			]);
+			expect(await collectNestedAgentsDirs(root, { maxDepth: 1 })).toEqual(["alpha", "beta", "gamma"]);
+			expect(await collectNestedAgentsDirs(root, { maxEntries: 2 })).toEqual(["alpha", "beta"]);
+			expect(await collectNestedAgentsDirs(root, { maxDepth: 2 })).toEqual([
+				"alpha",
+				"beta",
+				"gamma",
+				"alpha/deep",
+				"beta/deep",
+			]);
+			expect(await collectNestedAgentsDirs(path.join(root, "missing"))).toEqual([]);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("sorts manifest directories by name before traversing them", async () => {
+		const root = await realpath(await mkdtemp(path.join(tmpdir(), "paa-core-sort-")));
+		try {
+			for (const relative of ["zeta/AGENTS.md", "alpha/AGENTS.md"]) {
+				const filepath = path.join(root, relative);
+				await mkdir(path.dirname(filepath), { recursive: true });
+				await writeFile(filepath, relative, "utf8");
+			}
+
+			expect(await collectNestedAgentsDirs(root, { maxDepth: 1 })).toEqual(["alpha", "zeta"]);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("keeps a large manifest listing in sorted order", async () => {
+		const root = await realpath(await mkdtemp(path.join(tmpdir(), "paa-core-sort-large-")));
+		const names = [
+			"k130",
+			"q208",
+			"m156",
+			"c026",
+			"n169",
+			"p195",
+			"s234",
+			"b013",
+			"i104",
+			"v273",
+			"f065",
+			"j117",
+			"w286",
+			"t247",
+			"o182",
+			"e052",
+			"d039",
+			"u260",
+			"r221",
+			"l143",
+			"g078",
+			"x299",
+			"h091",
+			"a000",
+		];
+		try {
+			for (const name of names) {
+				await mkdir(path.join(root, name), { recursive: true });
+				await writeFile(path.join(root, name, "AGENTS.md"), name, "utf8");
+			}
+
+			expect(await collectNestedAgentsDirs(root, { maxDepth: 1 })).toEqual([...names].sort());
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("collectRecursiveAgents", () => {
+	test("returns no target when the path cannot be resolved", async () => {
+		expect(await resolveContainedPath("missing/file.ts", "/tmp/paa-no-such-root")).toBeNull();
+	});
+
 	test("collects nested AGENTS from closest to broadest and skips cwd root", async () => {
 		const cwd = "/repo";
 		const map = new Map([
@@ -76,6 +196,15 @@ describe("collectRecursiveAgents", () => {
 			expect.objectContaining({ filepath: path.resolve("/repo/nested/deeper/AGENTS.md"), content: "deep rules\n" }),
 			expect.objectContaining({ filepath: path.resolve("/repo/nested/AGENTS.md"), content: "nested rules\n" }),
 		]);
+	});
+
+	test("accepts an explicit filename array", async () => {
+		const filepath = path.resolve("/repo/nested/AGENTS.md");
+		const results = await collectRecursive("nested/file.ts", "/repo", async (candidate) => {
+			return candidate === filepath ? "nested rules\n" : "";
+		}, ["AGENTS.md"]);
+
+		expect(results).toEqual([expect.objectContaining({ filepath, content: "nested rules\n" })]);
 	});
 
 	test("skips the target AGENTS file itself", async () => {
@@ -108,6 +237,24 @@ describe("collectRecursive limits", () => {
 		expect(result.content).toContain("please read the file directly: /repo/AGENTS.md");
 	});
 
+	test("does not mark content truncated when it exactly fits the byte limit", () => {
+		expect(truncateForContext("abc", 3)).toEqual({
+			content: "abc",
+			truncated: false,
+			originalBytes: 3,
+			injectedBytes: 3,
+		});
+	});
+
+	test("uses an empty prefix when truncation has no available bytes", () => {
+		expect(truncateForContext("abc", 0)).toEqual({
+			content: "",
+			truncated: true,
+			originalBytes: 3,
+			injectedBytes: 0,
+		});
+	});
+
 	test("honors the total per-read byte budget across multiple files", async () => {
 		const cwd = "/repo";
 		const map = new Map([
@@ -122,6 +269,16 @@ describe("collectRecursive limits", () => {
 		});
 
 		expect(results).toEqual([expect.objectContaining({ filepath: path.resolve("/repo/a/b/AGENTS.md") })]);
+	});
+
+	test("walks once when the total read budget is one byte", async () => {
+		const cwd = "/repo";
+		const filepath = path.resolve("/repo/a/AGENTS.md");
+		const results = await collectRecursive("a/file.ts", cwd, async (candidate) => (candidate === filepath ? "rules" : ""), {
+			maxBytesPerRead: 1,
+		});
+
+		expect(results).toEqual([expect.objectContaining({ filepath })]);
 	});
 });
 

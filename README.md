@@ -21,9 +21,11 @@ Beyond AGENTS.md, the package also supports [DESIGN.md](https://designmd.ai/what
 
 ### AGENTS.md
 
-When pi reads a file below the session root, this extension prepends ancestor `AGENTS.md` files to the `read` result before the file content.
+When a tool touches a file below the session root, this extension prepends ancestor `AGENTS.md` files to that tool's result before the file content.
 
-If pi reads:
+The trigger is generic path extraction over any tool's input — structured keys such as `path`, `file_path`, `workdir`, or `cwd`, plus path-looking tokens inside arbitrary strings like `cat frontend/src/components/Button.tsx`. No tool name is matched, so tool replacements that hide the built-in `read`/`bash` tools behind a single shell tool (codex-style adapters, MCP gateways, ...) keep nested rules flowing.
+
+If a tool touches:
 
 ```text
 frontend/src/components/Button.tsx
@@ -45,10 +47,18 @@ A few rules keep that behavior sane:
 - large context files are truncated safely
 - `--no-context-files` disables the entire extension
 
+#### Transcript sweep (defense in depth)
+
+On every LLM request the extension also sweeps the recent transcript (last 40 messages) for tool calls whose paths never reached the model — restored sessions, foreign tool surfaces, or dropped injections — and appends any still-pending ancestor files as a context message. Because the request-time transform is ephemeral, accumulated files are re-appended on each request so they stay visible for the rest of the session.
+
+#### Startup manifest (backstop)
+
+At session start the extension walks the project (bounded depth, common dependency directories skipped) and appends an index of every directory containing a nested `AGENTS.md` to the system prompt, with an instruction to read the applicable file before working under those paths. This is tool-independent by construction: even an agent whose tools never expose a path discovers where the nested rules live. Disable with `PI_NESTED_AGENTS_MANIFEST=0`.
+
 ### DESIGN.md (opt-in via env vars)
 
 Root injection — appends `cwd/DESIGN.md` content to the system prompt before every agent start when enabled.
-Ancestor injection — walks ancestor directories for `DESIGN.md` files (same hierarchy rules as AGENTS.md).
+Ancestor injection — walks ancestor directories for `DESIGN.md` files (same hierarchy rules and generic tool trigger as AGENTS.md).
 
 Both are disabled by default. Enable via:
 
@@ -56,7 +66,7 @@ Both are disabled by default. Enable via:
 # Inject root cwd/DESIGN.md into each agent-start system prompt
 PI_ROOT_DESIGN_MD=1
 
-# Walk ancestor dirs for DESIGN.md on file reads
+# Walk ancestor dirs for DESIGN.md on tool activity
 PI_ANCESTOR_DESIGN_MD=1
 
 # Both work independently and can be combined
@@ -121,4 +131,3 @@ bun test tests/*.test.ts
 ## License
 
 MIT
-
