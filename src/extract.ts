@@ -36,8 +36,8 @@ const MAX_CANDIDATES = 16;
 const LINE_SUFFIX = /:[0-9]+(?:[-,][0-9]+)*$/;
 const HAS_SEPARATOR = /[\\/]/;
 const HAS_EXTENSION = /\.[A-Za-z0-9]{1,8}$/;
-const SHELL_TOKEN_PATTERN = /(?:[^\s"']+|"[^"]*"?|'[^']*'?)+/g;
-const SHELL_QUOTE_PATTERN = /'([^']*)'?|"([^"]*)"?/g;
+const SHELL_TOKEN_PATTERN = /(?:[^\s"'`]+|"[^"]*"?|'[^']*'?|`[^`]*`?)+/g;
+const SHELL_QUOTE_PATTERN = /'([^']*)'?|"([^"]*)"?|`([^`]*)`?/g;
 
 type CandidateAdder = (raw: string, base: string) => void;
 
@@ -46,7 +46,7 @@ function cleanValue(raw: string) {
 		.trim()
 		.replace(/^['"`]|['"`]$/g, "")
 		.replace(/[,;:]+$/, "")
-		.trim();
+			.trim();
 }
 
 function removeAttachedFlagValue(value: string) {
@@ -65,7 +65,13 @@ function looksLikePath(value: string) {
 }
 
 function tokenCandidate(raw: string): string | undefined {
-	const cleaned = removeAttachedFlagValue(cleanValue(raw)).replace(LINE_SUFFIX, "");
+	// Trailing closing punctuation glued on by tokenization is junk (a quoted span
+	// ending in '}'), but only strip it when no quote precedes it: a quote before
+	// the closers marks a JSON fragment like file.ts"}}, which stays rejected.
+	if (/['"`][)\]}]+$/.test(raw)) return undefined;
+	const cleaned = removeAttachedFlagValue(cleanValue(raw))
+		.replace(/[)\]}]+$/, "")
+		.replace(LINE_SUFFIX, "");
 	return looksLikePath(cleaned) ? cleaned : undefined;
 }
 
@@ -80,22 +86,25 @@ function resolveDirectoryTarget(token: string, base: string) {
 	return path.resolve(base, token);
 }
 
-function addTokenCandidate(token: string, base: string, addCandidate: CandidateAdder) {
-	const candidate = tokenCandidate(token);
-	if (candidate) addCandidate(candidate, base);
-}
-
 /** Token scan with shell working-directory tracking for cd/pushd/ls-style targets. */
 /** Split on whitespace while keeping quoted spans ("my dir") as single tokens. */
 function shellTokens(raw: string) {
 	return (raw.match(SHELL_TOKEN_PATTERN) ?? [])
-		.map((token) => token.replace(SHELL_QUOTE_PATTERN, "$1$2"))
+		.map((token) => token.replace(SHELL_QUOTE_PATTERN, "$1$2$3"))
 		.filter(Boolean);
 }
 
-function scanTokens(raw: string, initialBase: string, addCandidate: CandidateAdder) {
+const SHELL_OPERATORS = new Set(["&&", "||", ";", "|", "&", ">", "<", ">>", "<<"]);
+
+function isShellOperator(token: string) {
+	return SHELL_OPERATORS.has(token) || token.startsWith("-");
+}
+
+function scanTokens(raw: string, initialBase: string, addCandidate: CandidateAdder, depth = 0) {
 	const state: TokenState = { base: initialBase, expectsDirectory: false };
-	for (const token of shellTokens(raw)) {
+	const tokens = shellTokens(raw);
+	const bareWords: string[] = [];
+	for (const [index, token] of tokens.entries()) {
 		const cleaned = cleanValue(token);
 		if (!cleaned) continue;
 		if (isDirectoryTargetMarker(cleaned)) {
@@ -103,6 +112,8 @@ function scanTokens(raw: string, initialBase: string, addCandidate: CandidateAdd
 			continue;
 		}
 		if (state.expectsDirectory) {
+			// Flags between a directory keyword and its operand do not consume it.
+			if (cleaned.startsWith("-")) continue;
 			state.expectsDirectory = false;
 			const resolved = resolveDirectoryTarget(cleaned, state.base);
 			if (resolved) {
@@ -111,9 +122,23 @@ function scanTokens(raw: string, initialBase: string, addCandidate: CandidateAdd
 			}
 			continue;
 		}
-		addTokenCandidate(token, state.base, addCandidate);
+		// A whitespace-bearing token can only come from a quoted span, ambiguous between
+		// one path with spaces and a nested command line. Keep both readings: the whole
+		// span as a candidate, plus a depth-bounded rescan of its contents.
+		const pathShaped = tokenCandidate(token);
+		if (pathShaped) addCandidate(pathShaped, state.base);
+		// A bare operand of any command may name a directory (find src, rg pattern src);
+		// the command word itself never does. Collected second so prose words only
+		// consume candidate budget left over after real paths; URLs never qualify.
+		if (!pathShaped && index > 0 && !isShellOperator(cleaned) && !cleaned.includes("://")) {
+			bareWords.push(cleaned);
+		}
+		if (/\s/.test(token) && depth < MAX_DEPTH) scanTokens(token, state.base, addCandidate, depth + 1);
 	}
+	for (const word of bareWords) addCandidate(word, state.base);
 }
+
+
 
 function tryParseJson(text: string): unknown | undefined {
 	const trimmed = text.trim();
@@ -132,7 +157,7 @@ function scanString(raw: string, base: string, depth: number, addCandidate: Cand
 		collectStructuredValue(parsed, depth + 1, base, addCandidate);
 		collectTokenValue(parsed, depth + 1, base, addCandidate);
 	}
-	scanTokens(budget, base, addCandidate);
+	scanTokens(budget, base, addCandidate, depth);
 }
 
 function computeRecordBase(entries: Array<[string, unknown]>, base: string) {

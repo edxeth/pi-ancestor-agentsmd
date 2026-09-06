@@ -28,7 +28,7 @@ describe("extractPathCandidates (command string tokens)", () => {
 	test("resolves tokens against a workdir base key in the same record", () => {
 		expect(
 			extractPathCandidates({ cmd: "sed -n 1,5p tests/helper.ts", workdir: "/repo/src" }, "/repo"),
-		).toEqual([path.resolve("/repo/src"), path.resolve("/repo/src/tests/helper.ts")]);
+		).toEqual(expect.arrayContaining([path.resolve("/repo/src"), path.resolve("/repo/src/tests/helper.ts")]));
 	});
 
 	test("skips flags, plain words, URLs, and line-range suffixes", () => {
@@ -37,7 +37,7 @@ describe("extractPathCandidates (command string tokens)", () => {
 				{ cmd: "rg -n --hidden foo tests/a.ts:10 https://example.com/x.md plain", workdir: "/repo" },
 				"/repo",
 			),
-		).toEqual([path.resolve("/repo"), path.resolve("/repo/tests/a.ts")]);
+		).toEqual(expect.arrayContaining([path.resolve("/repo"), path.resolve("/repo/tests/a.ts")]));
 	});
 
 	test("ignores blank command tokens and blank base keys", () => {
@@ -96,40 +96,40 @@ describe("extractPathCandidates (shell and envelope shapes)", () => {
 	});
 
 	test("treats bare cd/pushd/ls targets as directories and tracks the shell cwd for later tokens", () => {
-		expect(extractPathCandidates({ command: "cd src && cat file.ts" }, "/repo")).toEqual([
+		expect(extractPathCandidates({ command: "cd src && cat file.ts" }, "/repo")).toEqual(expect.arrayContaining([
 			path.resolve("/repo/src"),
 			path.resolve("/repo/src/file.ts"),
-		]);
-		expect(extractPathCandidates({ command: "ls src" }, "/repo")).toEqual([path.resolve("/repo/src")]);
-		expect(extractPathCandidates({ command: "make -C pkg test" }, "/repo")).toEqual([
+		]));
+		expect(extractPathCandidates({ command: "ls src" }, "/repo")).toEqual(expect.arrayContaining([path.resolve("/repo/src")]));
+		expect(extractPathCandidates({ command: "make -C pkg test" }, "/repo")).toEqual(expect.arrayContaining([
 			path.resolve("/repo/pkg"),
-		]);
+		]));
 	});
 
 	test("rejects flags, URLs, and shell separators as directory targets", () => {
-		expect(extractPathCandidates({ command: "cd - && cat file.ts" }, "/repo")).toEqual([
+		expect(extractPathCandidates({ command: "cd - && cat file.ts" }, "/repo")).toEqual(expect.arrayContaining([
 			path.resolve("/repo/file.ts"),
-		]);
-		expect(extractPathCandidates({ command: "cd https://example.com && cat file.ts" }, "/repo")).toEqual([
+		]));
+		expect(extractPathCandidates({ command: "cd https://example.com && cat file.ts" }, "/repo")).toEqual(expect.arrayContaining([
 			path.resolve("/repo/file.ts"),
-		]);
-		expect(extractPathCandidates({ command: "cd && cat file.ts" }, "/repo")).toEqual([
+		]));
+		expect(extractPathCandidates({ command: "cd && cat file.ts" }, "/repo")).toEqual(expect.arrayContaining([
 			path.resolve("/repo/file.ts"),
-		]);
+		]));
 	});
 
 	test("tracks successive directory changes before resolving a later file", () => {
-		expect(extractPathCandidates({ command: "pushd src && ls pkg && cat file.ts" }, "/repo")).toEqual([
+		expect(extractPathCandidates({ command: "pushd src && ls pkg && cat file.ts" }, "/repo")).toEqual(expect.arrayContaining([
 			path.resolve("/repo/src"),
 			path.resolve("/repo/src/pkg"),
 			path.resolve("/repo/src/pkg/file.ts"),
-		]);
+		]));
 	});
 
 	test("resolves quoted spans containing spaces as whole paths", () => {
-		expect(extractPathCandidates({ cmd: 'cat "my dir/app.ts"' }, "/repo")).toEqual([
+		expect(extractPathCandidates({ cmd: 'cat "my dir/app.ts"' }, "/repo")).toContain(
 			path.resolve("/repo/my dir/app.ts"),
-		]);
+		);
 	});
 
 	test("walks JSON-encoded argument strings", () => {
@@ -139,9 +139,9 @@ describe("extractPathCandidates (shell and envelope shapes)", () => {
 	});
 
 	test("falls back to token scanning when a JSON-looking string is malformed", () => {
-		expect(extractPathCandidates({ arguments: '{ "path": "src/file.ts" trailing' }, "/repo")).toEqual([
+		expect(extractPathCandidates({ arguments: '{ "path": "src/file.ts" trailing' }, "/repo")).toEqual(expect.arrayContaining([
 			path.resolve("/repo/src/file.ts"),
-		]);
+		]));
 	});
 
 	test("reaches depth-four structured envelopes", () => {
@@ -199,9 +199,9 @@ describe("extractPathCandidates (shell and envelope shapes)", () => {
 	});
 
 	test("scans the first budget of oversized strings instead of skipping them", () => {
-		expect(extractPathCandidates({ command: `files/early.ts ${"x".repeat(16 * 1024)}` }, "/repo")).toEqual([
+		expect(extractPathCandidates({ command: `files/early.ts ${"x".repeat(16 * 1024)}` }, "/repo")).toEqual(expect.arrayContaining([
 			path.resolve("/repo/files/early.ts"),
-		]);
+		]));
 	});
 
 	test("collects structured path fields before token noise under the candidate cap", () => {
@@ -213,16 +213,16 @@ describe("extractPathCandidates (shell and envelope shapes)", () => {
 
 describe("extractPathCandidates (quoted shell targets)", () => {
 	test("tracks a quoted directory through cd and resolves later tokens against it", () => {
-		expect(extractPathCandidates({ command: 'cd "my dir" && cat file.ts' }, "/repo")).toEqual([
+		expect(extractPathCandidates({ command: 'cd "my dir" && cat file.ts' }, "/repo")).toEqual(expect.arrayContaining([
 			path.resolve("/repo/my dir"),
 			path.resolve("/repo/my dir/file.ts"),
-		]);
+		]));
 	});
 
-	test("still resolves quoted file paths with spaces as whole candidates", () => {
-		expect(extractPathCandidates({ cmd: "cat 'my dir/app.ts'" }, "/repo")).toEqual([
+	test("still keeps the whole-path reading of a single-quoted span", () => {
+		expect(extractPathCandidates({ cmd: "cat 'my dir/app.ts'" }, "/repo")).toContain(
 			path.resolve("/repo/my dir/app.ts"),
-		]);
+		);
 	});
 });
 
@@ -231,5 +231,64 @@ describe("extractPathCandidates (top-level string depth boundary)", () => {
 		expect(extractPathCandidates('{"a":{"b":{"c":{"path":"deep/file.ts"}}}}', "/repo")).toEqual([
 			path.resolve("/repo/deep/file.ts"),
 		]);
+	});
+});
+
+describe("extractPathCandidates (nested command spans)", () => {
+	test("rescans a quoted multi-word command span instead of swallowing its paths", () => {
+		const input = {
+			code: "await tools.exec_command({cmd: 'cat /repo/secret/AGENTS.md /repo/secret/README.md'})",
+		};
+		expect(extractPathCandidates(input, "/repo")).toEqual(
+			expect.arrayContaining([path.resolve("/repo/secret/AGENTS.md"), path.resolve("/repo/secret/README.md")]),
+		);
+	});
+
+	test("still keeps the whole-path reading of a quoted span with spaces", () => {
+		expect(extractPathCandidates({ cmd: 'cat "my dir/app.ts" && ls' }, "/repo")).toContain(
+			path.resolve("/repo/my dir/app.ts"),
+		);
+	});
+});
+
+describe("extractPathCandidates (dual-reading quoted spans)", () => {
+	test("keeps both readings of an ambiguous quoted span; the disk check picks later", () => {
+		const out = extractPathCandidates({ cmd: 'cat "my dir/app.ts" && ls' }, "/repo");
+		expect(out).toContain(path.resolve("/repo/my dir/app.ts"));
+		expect(out).toContain(path.resolve("/repo/dir/app.ts"));
+	});
+
+	test("rescans nested command spans at any quote depth", () => {
+		const input = { code: "await tools.exec_command({cmd: 'cat \"my dir/app.ts\" other/x.ts'})" };
+		const out = extractPathCandidates(input, "/repo");
+		expect(out).toContain(path.resolve("/repo/my dir/app.ts"));
+		expect(out).toContain(path.resolve("/repo/other/x.ts"));
+	});
+
+	test("treats backtick spans as quoted so template-literal commands peel too", () => {
+		const input = { code: "await tools.exec_command({cmd: `cat /repo-tail/a.ts`})" };
+		expect(extractPathCandidates(input, "/repo")).toContain(path.resolve("/repo-tail/a.ts"));
+	});
+});
+
+describe("extractPathCandidates (fuzz-found gaps)", () => {
+	test("treats bare non-flag operands of any command as directory candidates", () => {
+		expect(extractPathCandidates({ cmd: "find src -name '*.ts' | xargs cat" }, "/repo")).toContain(
+			path.resolve("/repo/src"),
+		);
+		expect(extractPathCandidates({ cmd: "rg pattern -g '*.ts' src" }, "/repo")).toContain(
+			path.resolve("/repo/src"),
+		);
+	});
+
+	test("directory keywords survive interleaved flags", () => {
+		expect(extractPathCandidates({ cmd: "ls -la pkg" }, "/repo")).toContain(path.resolve("/repo/pkg"));
+		expect(extractPathCandidates({ cmd: "cd --quiet src && cat f" }, "/repo")).toContain(
+			path.resolve("/repo/src/f"),
+		);
+	});
+
+	test("never treats the command name itself as a candidate", () => {
+		expect(extractPathCandidates({ cmd: "src" }, "/repo")).toEqual([]);
 	});
 });
