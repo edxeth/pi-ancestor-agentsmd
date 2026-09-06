@@ -251,6 +251,27 @@ describe("extension integration", () => {
 		}
 	});
 
+	test("ignores primitive tool-result inputs", async () => {
+		const tree = await makeTree({ "src/AGENTS.md": "src rules", "src/file.ts": "x" });
+		try {
+			const extension = await loadExtension();
+			const fake = makeFakePi(tree.root);
+			extension(fake.pi as unknown as ExtensionAPI);
+			await fake.emit("session_start", {});
+
+			const result = await fake.emit("tool_result", {
+				type: "tool_result",
+				toolName: "shell_runner",
+				input: `cat ${tree.path("src/file.ts")}`,
+				content: [{ type: "text", text: "x" }],
+				isError: false,
+			});
+			expect(result).toBeUndefined();
+		} finally {
+			await tree.cleanup();
+		}
+	});
+
 	test("places AGENTS.md above DESIGN.md for generic tool results", async () => {
 		const previous = process.env.PI_ANCESTOR_DESIGN_MD;
 		process.env.PI_ANCESTOR_DESIGN_MD = "1";
@@ -627,12 +648,13 @@ describe("extension integration", () => {
 			expect(swept.content).toContain("Instructions from:");
 			expect(swept.content).toContain("tests rules");
 
-			// The transform is per-request; the same injection must re-append on the
-			// next request without duplicating content inside the message.
+			// The transform is per-request; a fed-back sweep message is replaced by
+			// a fresh one rather than appended after.
 			const second = (await fake.emit("context", { messages: [...transcript, swept] })) as {
 				messages: Array<{ role: string; content: string }>;
 			};
-			expect(second.messages).toHaveLength(transcript.length + 2);
+			expect(second.messages).toHaveLength(transcript.length + 1);
+			expect(second.messages).not.toContain(swept);
 			const sweptAgain = second.messages[second.messages.length - 1]!;
 			expect(sweptAgain.role).toBe("custom");
 			expect(sweptAgain.content).toContain("tests rules");
@@ -950,4 +972,396 @@ describe("extension integration", () => {
 			await tree.cleanup();
 		}
 	});
+});
+
+test("isolates session roots across overlapping sessions", async () => {
+	const treeA = await makeTree({ "pkg/AGENTS.md": "A_RULES", "pkg/file.ts": "a", "other/AGENTS.md": "A_OTHER_RULES", "other/file.ts": "x" });
+	const treeB = await makeTree({ "pkg/AGENTS.md": "B_RULES", "pkg/file.ts": "b" });
+	try {
+		const extension = await loadExtension();
+		const sessionA = makeFakePi(treeA.root, { sessionFile: "/tmp/session-a.jsonl" });
+		const sessionB = makeFakePi(treeB.root, { sessionFile: "/tmp/session-b.jsonl" });
+		extension(sessionA.pi as unknown as ExtensionAPI);
+		extension(sessionB.pi as unknown as ExtensionAPI);
+		await sessionA.emit("session_start", {});
+		await sessionB.emit("session_start", {});
+
+		const absolute = await sessionA.emit("tool_result", {
+			type: "tool_result",
+			toolName: "shell_runner",
+			input: { cmd: `cat ${treeA.path("pkg/file.ts")}` },
+			content: [{ type: "text", text: "a" }],
+			isError: false,
+		});
+		expect(contentText(absolute)).toContain("A_RULES");
+
+		const relative = await sessionA.emit("tool_result", {
+			type: "tool_result",
+			toolName: "shell_runner",
+			input: { cmd: "cat other/file.ts", workdir: treeA.root },
+			content: [{ type: "text", text: "x" }],
+			isError: false,
+		});
+		const relativeText = contentText(relative);
+		expect(relativeText).toContain("A_OTHER_RULES");
+		expect(relativeText).not.toContain("B_RULES");
+	} finally {
+		await treeA.cleanup();
+		await treeB.cleanup();
+	}
+});
+
+test("snapshots applicable files at tool_call before execution removes their subtree", async () => {
+	const tree = await makeTree({
+		"pkg/AGENTS.md": "PKG_RULES",
+		"pkg/deep/AGENTS.md": "DEEP_RULES",
+		"pkg/deep/file.ts": "x",
+	});
+	try {
+		const extension = await loadExtension();
+		const fake = makeFakePi(tree.root);
+		extension(fake.pi as unknown as ExtensionAPI);
+		await fake.emit("session_start", {});
+
+		await fake.emit("tool_call", {
+			type: "tool_call",
+			toolCallId: "call-snap",
+			toolName: "shell_runner",
+			input: { cmd: "rm -rf pkg/deep" },
+		});
+		// The command removes the subtree before the result is processed.
+		await (await import("node:fs/promises")).rm(tree.path("pkg/deep"), { recursive: true, force: true });
+
+		const result = await fake.emit("tool_result", {
+			type: "tool_result",
+			toolCallId: "call-snap",
+			toolName: "shell_runner",
+			input: { cmd: "rm -rf pkg/deep" },
+			content: [{ type: "text", text: "" }],
+			isError: false,
+		});
+		const text = contentText(result);
+		expect(text).toContain("DEEP_RULES");
+		expect(text).toContain("PKG_RULES");
+	} finally {
+		await tree.cleanup();
+	}
+});
+
+test("evicts the oldest pre-execution snapshot when the cache reaches its bound", async () => {
+	const tree = await makeTree({ "pkg/AGENTS.md": "PKG_RULES", "pkg/file.ts": "x" });
+	try {
+		const extension = await loadExtension();
+		const fake = makeFakePi(tree.root);
+		extension(fake.pi as unknown as ExtensionAPI);
+		await fake.emit("session_start", {});
+
+		for (let index = 0; index < 65; index++) {
+			await fake.emit("tool_call", {
+				type: "tool_call",
+				toolCallId: `call-${index}`,
+				toolName: "read",
+				input: { path: tree.path("pkg/file.ts") },
+			});
+		}
+		await rm(tree.path("pkg/AGENTS.md"));
+
+		const resultFor = (toolCallId: string) => ({
+			type: "tool_result",
+			toolCallId,
+			toolName: "read",
+			input: { path: tree.path("pkg/file.ts") },
+			content: [{ type: "text", text: "x" }],
+			isError: false,
+		});
+
+		expect(await fake.emit("tool_result", resultFor("call-0"))).toBeUndefined();
+		expect(contentText(await fake.emit("tool_result", resultFor("call-64")))).toContain("PKG_RULES");
+	} finally {
+		await tree.cleanup();
+	}
+});
+
+test("does not let empty snapshots evict a real pre-execution snapshot", async () => {
+	const tree = await makeTree({
+		"pkg/AGENTS.md": "PKG_RULES",
+		"pkg/file.ts": "x",
+		"empty/file.ts": "empty",
+	});
+	try {
+		const extension = await loadExtension();
+		const fake = makeFakePi(tree.root);
+		extension(fake.pi as unknown as ExtensionAPI);
+		await fake.emit("session_start", {});
+
+		await fake.emit("tool_call", {
+			type: "tool_call",
+			toolCallId: "real-first",
+			toolName: "read",
+			input: { path: tree.path("pkg/file.ts") },
+		});
+		for (let index = 0; index < 64; index++) {
+			await fake.emit("tool_call", {
+				type: "tool_call",
+				toolCallId: `empty-${index}`,
+				toolName: "read",
+				input: { path: tree.path("empty/file.ts") },
+			});
+		}
+		await rm(tree.path("pkg/AGENTS.md"));
+
+		const result = await fake.emit("tool_result", {
+			type: "tool_result",
+			toolCallId: "real-first",
+			toolName: "read",
+			input: { path: tree.path("pkg/file.ts") },
+			content: [{ type: "text", text: "x" }],
+			isError: false,
+		});
+		expect(contentText(result)).toContain("PKG_RULES");
+	} finally {
+		await tree.cleanup();
+	}
+});
+
+test("retains more than one pre-execution snapshot before reaching the cache bound", async () => {
+	const tree = await makeTree({ "pkg/AGENTS.md": "PKG_RULES", "pkg/file.ts": "x" });
+	try {
+		const extension = await loadExtension();
+		const fake = makeFakePi(tree.root);
+		extension(fake.pi as unknown as ExtensionAPI);
+		await fake.emit("session_start", {});
+
+		for (const toolCallId of ["first-snapshot", "second-snapshot"]) {
+			await fake.emit("tool_call", {
+				type: "tool_call",
+				toolCallId,
+				toolName: "read",
+				input: { path: tree.path("pkg/file.ts") },
+			});
+		}
+		await rm(tree.path("pkg/AGENTS.md"));
+
+		const result = await fake.emit("tool_result", {
+			type: "tool_result",
+			toolCallId: "first-snapshot",
+			toolName: "read",
+			input: { path: tree.path("pkg/file.ts") },
+			content: [{ type: "text", text: "x" }],
+			isError: false,
+		});
+		expect(contentText(result)).toContain("PKG_RULES");
+	} finally {
+		await tree.cleanup();
+	}
+});
+
+test("recovers delivery when a downstream handler replaces the injected tool result", async () => {
+	const tree = await makeTree({ "pkg/AGENTS.md": "PKG_RULES", "pkg/file.ts": "x" });
+	try {
+		const extension = await loadExtension();
+		const fake = makeFakePi(tree.root);
+		extension(fake.pi as unknown as ExtensionAPI);
+		await fake.emit("session_start", {});
+
+		const injected = await fake.emit("tool_result", {
+			type: "tool_result",
+			toolCallId: "call-strip",
+			toolName: "shell_runner",
+			input: { path: tree.path("pkg/file.ts") },
+			content: [{ type: "text", text: "x" }],
+			isError: false,
+		});
+		expect(contentText(injected)).toContain("PKG_RULES");
+
+		// A later extension replaced the result before the transcript was saved.
+		const strippedTranscript = [
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id: "call-strip", name: "shell_runner", arguments: { path: tree.path("pkg/file.ts") } }],
+				timestamp: 1,
+			},
+			{
+				role: "toolResult",
+				toolCallId: "call-strip",
+				toolName: "shell_runner",
+				content: [{ type: "text", text: "x" }],
+				isError: false,
+				timestamp: 2,
+			},
+		];
+		const recovered = (await fake.emit("context", { messages: strippedTranscript })) as {
+			messages: Array<{ role: string; content: unknown }>;
+		};
+		const recoveredText = JSON.stringify(recovered.messages);
+		expect(recoveredText).toContain("PKG_RULES");
+		expect(recovered.messages.at(-1)?.role).toBe("custom");
+	} finally {
+		await tree.cleanup();
+	}
+});
+
+test("does not re-deliver a tool-result injection after its header reaches the transcript", async () => {
+	const tree = await makeTree({ "pkg/AGENTS.md": "PKG_RULES", "pkg/file.ts": "x" });
+	try {
+		const extension = await loadExtension();
+		const fake = makeFakePi(tree.root);
+		extension(fake.pi as unknown as ExtensionAPI);
+		await fake.emit("session_start", {});
+
+		const injected = await fake.emit("tool_result", {
+			type: "tool_result",
+			toolCallId: "call-confirm",
+			toolName: "read",
+			input: { path: tree.path("pkg/file.ts") },
+			content: [{ type: "text", text: "x" }],
+			isError: false,
+		});
+		expect(contentText(injected)).toContain("PKG_RULES");
+
+		const finalTranscript = [
+			{
+				role: "toolResult",
+				toolCallId: "call-confirm",
+				content: [{ type: "text", text: `Instructions from: ${tree.path("pkg/AGENTS.md")}\nPKG_RULES` }],
+			},
+		];
+
+		expect(await fake.emit("context", { messages: finalTranscript })).toBeUndefined();
+	} finally {
+		await tree.cleanup();
+	}
+});
+
+test("does not retain stale sweep files after compaction without new tool calls", async () => {
+	const tree = await makeTree({ "tests/AGENTS.md": "tests rules", "tests/helper.ts": "helper" });
+	try {
+		const extension = await loadExtension();
+		const fake = makeFakePi(tree.root, { sessionFile: "/tmp/compact-stale-sweep.jsonl" });
+		extension(fake.pi as unknown as ExtensionAPI);
+		await fake.emit("session_start", {});
+
+		const swept = await fake.emit("context", {
+			messages: [{ role: "assistant", content: [{ type: "toolCall", arguments: { path: "tests/helper.ts" } }] }],
+		});
+		expect(swept).toBeDefined();
+		await fake.emit("session_compact", {});
+
+		expect(await fake.emit("context", { messages: [] })).toBeUndefined();
+	} finally {
+		await tree.cleanup();
+	}
+});
+
+test("does not retain stale sweep files after shutdown without new tool calls", async () => {
+	const tree = await makeTree({ "tests/AGENTS.md": "tests rules", "tests/helper.ts": "helper" });
+	try {
+		const extension = await loadExtension();
+		const fake = makeFakePi(tree.root, { sessionFile: "/tmp/shutdown-stale-sweep.jsonl" });
+		extension(fake.pi as unknown as ExtensionAPI);
+		await fake.emit("session_start", {});
+
+		const swept = await fake.emit("context", {
+			messages: [{ role: "assistant", content: [{ type: "toolCall", arguments: { path: "tests/helper.ts" } }] }],
+		});
+		expect(swept).toBeDefined();
+		await fake.emit("session_shutdown", {});
+
+		expect(await fake.emit("context", { messages: [] })).toBeUndefined();
+	} finally {
+		await tree.cleanup();
+	}
+});
+
+test("recovers delivery when transcript messages or blocks are malformed", async () => {
+	const tree = await makeTree({ "pkg/AGENTS.md": "PKG_RULES", "pkg/file.ts": "x" });
+	try {
+		const extension = await loadExtension();
+		const fake = makeFakePi(tree.root);
+		extension(fake.pi as unknown as ExtensionAPI);
+		await fake.emit("session_start", {});
+
+		const injected = await fake.emit("tool_result", {
+			type: "tool_result",
+			toolCallId: "call-malformed",
+			toolName: "read",
+			input: { path: tree.path("pkg/file.ts") },
+			content: [{ type: "text", text: "x" }],
+			isError: false,
+		});
+		expect(contentText(injected)).toContain("PKG_RULES");
+
+		const recovered = (await fake.emit("context", {
+			messages: [
+				null,
+				{ role: "assistant", content: [null] },
+				{ role: "toolResult", content: "not an array" },
+			],
+		})) as { messages: Array<{ role: string; content: string }> };
+		expect(recovered.messages.at(-1)?.role).toBe("custom");
+		expect(recovered.messages.at(-1)?.content).toContain("PKG_RULES");
+	} finally {
+		await tree.cleanup();
+	}
+});
+
+test("preserves non-sweep custom messages while rebuilding the sweep message", async () => {
+	const tree = await makeTree({ "tests/AGENTS.md": "tests rules", "tests/helper.ts": "helper" });
+	try {
+		const extension = await loadExtension();
+		const fake = makeFakePi(tree.root);
+		extension(fake.pi as unknown as ExtensionAPI);
+		await fake.emit("session_start", {});
+
+		const preserved = { role: "user", customType: "ancestor-agentsmd", content: "keep this" };
+		const result = (await fake.emit("context", {
+			messages: [
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "call-filter", arguments: { path: "tests/helper.ts" } }],
+				},
+				preserved,
+			],
+		})) as { messages: unknown[] };
+		expect(result.messages).toContain(preserved);
+		expect(result.messages).toHaveLength(3);
+	} finally {
+		await tree.cleanup();
+	}
+});
+
+test("clears pending sweep files during compaction", async () => {
+	const tree = await makeTree({ "tests/AGENTS.md": "tests rules", "tests/helper.ts": "helper" });
+	try {
+		const extension = await loadExtension();
+		const fake = makeFakePi(tree.root, { sessionFile: "/tmp/compact-pending.jsonl" });
+		extension(fake.pi as unknown as ExtensionAPI);
+		await fake.emit("session_start", {});
+		await fake.emit("context", {
+			messages: [{ role: "assistant", content: [{ type: "toolCall", arguments: { path: "tests/helper.ts" } }] }],
+		});
+
+		await fake.emit("session_compact", {});
+		expect(await fake.emit("context", { messages: [] })).toBeUndefined();
+	} finally {
+		await tree.cleanup();
+	}
+});
+
+test("clears pending sweep files during shutdown", async () => {
+	const tree = await makeTree({ "tests/AGENTS.md": "tests rules", "tests/helper.ts": "helper" });
+	try {
+		const extension = await loadExtension();
+		const fake = makeFakePi(tree.root, { sessionFile: "/tmp/shutdown-pending.jsonl" });
+		extension(fake.pi as unknown as ExtensionAPI);
+		await fake.emit("session_start", {});
+		await fake.emit("context", {
+			messages: [{ role: "assistant", content: [{ type: "toolCall", arguments: { path: "tests/helper.ts" } }] }],
+		});
+
+		await fake.emit("session_shutdown", {});
+		expect(await fake.emit("context", { messages: [] })).toBeUndefined();
+	} finally {
+		await tree.cleanup();
+	}
 });

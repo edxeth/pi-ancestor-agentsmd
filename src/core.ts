@@ -149,19 +149,36 @@ function isWithinRoot(dir: string, root: string) {
 	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
+/**
+ * Climb from a missing path to its nearest existing ancestor, contained in the
+ * canonical session root. Returns null when the ancestor escapes the root or the
+ * filesystem root is reached.
+ */
+async function nearestExistingAncestor(target: string, canonicalRoot: string) {
+	let current = path.dirname(target);
+	for (;;) {
+		const canonical = await realpath(current).catch(() => null);
+		if (canonical !== null) return isWithinRoot(canonical, canonicalRoot) ? canonical : null;
+		const parent = path.dirname(current);
+		if (parent === current) return null;
+		current = parent;
+	}
+}
+
 export async function resolveContainedPath(filepath: string, cwd: string) {
 	const root = path.resolve(cwd);
 	const target = path.resolve(cwd, filepath);
 
-	try {
-		const canonicalRoot = await realpath(root);
-		const canonicalTarget = await realpath(target);
-		if (canonicalTarget === canonicalRoot) return null;
-		if (!isWithinRoot(canonicalTarget, canonicalRoot)) return null;
-		return { root: canonicalRoot, target: canonicalTarget };
-	} catch {
-		return null;
-	}
+	const canonicalRoot = await realpath(root).catch(() => null);
+	if (canonicalRoot === null) return null;
+	// A missing leaf (deleted target, glob, not-yet-created file) falls back to
+	// the nearest existing ancestor so the applicable rules still resolve.
+	const canonicalTarget =
+		(await realpath(target).catch(() => null)) ?? (await nearestExistingAncestor(target, canonicalRoot));
+	if (canonicalTarget === null) return null;
+	if (canonicalTarget === canonicalRoot) return null;
+	if (!isWithinRoot(canonicalTarget, canonicalRoot)) return null;
+	return { root: canonicalRoot, target: canonicalTarget };
 }
 
 export type TruncationResult = {
@@ -217,9 +234,40 @@ function resolveCollectOptions(filenamesOrOptions: string[] | CollectOptions): R
 	};
 }
 
+type InstructionFileResult = { file?: AgentsFile; remainingBytes: number };
+
+async function readContainedInstructionFile(
+	candidate: string,
+	root: string,
+	maxBytesPerFile: number,
+	remainingBytes: number,
+	readText: (filepath: string) => Promise<string>,
+): Promise<InstructionFileResult> {
+	// Canonicalize the instruction file itself: a symlink resolving outside the
+	// canonical session root is rejected instead of read.
+	const canonical = await realpath(candidate).catch(() => null);
+	if (canonical !== null && !isWithinRoot(canonical, root)) return { remainingBytes };
+
+	const rawContent = await readText(canonical ?? candidate);
+	if (!rawContent) return { remainingBytes };
+
+	const truncated = truncateForContext(rawContent, Math.min(maxBytesPerFile, remainingBytes), candidate);
+	return {
+		file: {
+			filepath: candidate,
+			content: truncated.content,
+			truncated: truncated.truncated,
+			originalBytes: truncated.originalBytes,
+			injectedBytes: truncated.injectedBytes,
+		},
+		remainingBytes: remainingBytes - truncated.injectedBytes,
+	};
+}
+
 async function collectDirectoryFiles(
 	current: string,
 	target: string,
+	root: string,
 	filenames: string[],
 	maxBytesPerFile: number,
 	remainingBytes: number,
@@ -229,18 +277,9 @@ async function collectDirectoryFiles(
 	for (const filename of filenames) {
 		const candidate = path.resolve(path.join(current, filename));
 		if (candidate === target) continue;
-		const rawContent = await readText(candidate);
-		if (!rawContent) continue;
-
-		const truncated = truncateForContext(rawContent, Math.min(maxBytesPerFile, remainingBytes), candidate);
-		files.push({
-			filepath: candidate,
-			content: truncated.content,
-			truncated: truncated.truncated,
-			originalBytes: truncated.originalBytes,
-			injectedBytes: truncated.injectedBytes,
-		});
-		remainingBytes -= truncated.injectedBytes;
+		const result = await readContainedInstructionFile(candidate, root, maxBytesPerFile, remainingBytes, readText);
+		if (result.file) files.push(result.file);
+		remainingBytes = result.remainingBytes;
 	}
 	return { files, remainingBytes };
 }
@@ -259,17 +298,21 @@ export async function collectRecursive(
 ): Promise<AgentsFile[]> {
 	const options = resolveCollectOptions(filenamesOrOptions);
 	let remainingBytes = options.maxBytesPerRead;
-	const root = path.resolve(cwd);
+	const root = await realpath(path.resolve(cwd)).catch(() => path.resolve(cwd));
 	const target = path.resolve(cwd, filepath);
+	// Canonicalize the walk anchor so symlinked roots (e.g. /tmp on macOS) compare
+	// consistently; fall back to the lexical path when it does not resolve.
+	const canonicalTarget = await realpath(target).catch(() => target);
 	// A trailing separator marks a directory target: start the walk at the
 	// directory itself instead of its parent.
-	let current = filepath.endsWith(path.sep) ? target : path.dirname(target);
+	let current = filepath.endsWith(path.sep) ? canonicalTarget : path.dirname(canonicalTarget);
 	const results: AgentsFile[] = [];
 
 	while (current !== root && isWithinRoot(current, root) && remainingBytes > 0) {
 		const directory = await collectDirectoryFiles(
 			current,
-			target,
+			canonicalTarget,
+			root,
 			options.filenames,
 			options.maxBytesPerFile,
 			remainingBytes,

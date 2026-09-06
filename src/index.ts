@@ -24,6 +24,7 @@ const ENTRY_CONTEXT_FILE_EVENT = "ancestor-agentsmd:context-file-event";
 const SINGLETON_SESSION_KEY = "__pi_ancestor_agentsmd_singleton__";
 const SWEEP_CUSTOM_TYPE = "ancestor-agentsmd";
 const SWEEP_SCAN_MESSAGES = 40;
+const SNAPSHOT_CACHE_MAX = 64;
 
 type InjectedFileRecord = {
 	filepath: string;
@@ -41,18 +42,18 @@ type SessionState = {
 	agentStartCount: number;
 	sweptFiles: AgentsFile[];
 	sweptToolCallIds: Set<string>;
+	toolCallSnapshots: Map<string, { designFiles: AgentsFile[]; agentsFiles: AgentsFile[] }>;
+	unconfirmedFiles: Map<string, AgentsFile>;
+	root: string;
+	disabled: boolean;
+	manifestDirs: string[];
 };
 
 const sessions = new Map<string, SessionState>();
-let sessionRoot = process.cwd();
-let disabled = hasNoContextFilesFlag();
-let manifestDirs: string[] = [];
-
-async function recomputeManifest() {
-	manifestDirs =
-		isAncestorAgentsMdEnabled() && isNestedAgentsManifestEnabled()
-			? await collectNestedAgentsDirs(sessionRoot)
-			: [];
+async function computeManifestDirs(root: string) {
+	return isAncestorAgentsMdEnabled() && isNestedAgentsManifestEnabled()
+		? await collectNestedAgentsDirs(root)
+		: [];
 }
 
 async function readFileContent(filepath: string) {
@@ -94,6 +95,11 @@ function getSessionState(sessionKey: string) {
 			agentStartCount: 0,
 			sweptFiles: [],
 			sweptToolCallIds: new Set(),
+			toolCallSnapshots: new Map(),
+			unconfirmedFiles: new Map(),
+			root: process.cwd(),
+			disabled: hasNoContextFilesFlag(),
+			manifestDirs: [],
 		};
 		sessions.set(sessionKey, state);
 	}
@@ -217,7 +223,7 @@ async function collectRootDesignPrompt(
 	basePrompt: string,
 ) {
 	if (!isRootDesignMdEnabled()) return undefined;
-	const contained = await resolveContainedPath("DESIGN.md", sessionRoot);
+	const contained = await resolveContainedPath("DESIGN.md", state.root);
 	if (!contained) return undefined;
 
 	const designPath = path.join(contained.root, "DESIGN.md");
@@ -229,7 +235,7 @@ async function collectRootDesignPrompt(
 	return basePrompt + `\n\n## ${designPath}\n\n${content}\n\n`;
 }
 
-function appendManifestPrompt(basePrompt: string) {
+function appendManifestPrompt(basePrompt: string, manifestDirs: string[]) {
 	if (!isAncestorAgentsMdEnabled()) return undefined;
 	if (!isNestedAgentsManifestEnabled()) return undefined;
 	if (manifestDirs.length === 0) return undefined;
@@ -277,6 +283,31 @@ async function collectFilesForTargets(targets: Array<{ root: string; target: str
 	return collected;
 }
 
+function hasCollectedToolFiles(files: CollectedToolFiles) {
+	return files.designFiles.length > 0 || files.agentsFiles.length > 0;
+}
+
+function rememberToolCallSnapshot(state: SessionState, toolCallId: string, files: CollectedToolFiles) {
+	if (state.toolCallSnapshots.size >= SNAPSHOT_CACHE_MAX) {
+		const oldest = state.toolCallSnapshots.keys().next().value;
+		if (oldest !== undefined) state.toolCallSnapshots.delete(oldest);
+	}
+	state.toolCallSnapshots.set(toolCallId, files);
+}
+
+async function snapshotToolCall(event: { input: unknown; toolCallId?: unknown }, state: SessionState) {
+	if (state.disabled) return;
+	if (!isObjectInput(event.input)) return;
+	if (typeof event.toolCallId !== "string") return;
+
+	const targets = await resolveContainedTargets(event.input, state.root);
+	if (targets.length === 0) return;
+
+	const collected = await collectFilesForTargets(targets);
+	if (!hasCollectedToolFiles(collected)) return;
+	rememberToolCallSnapshot(state, event.toolCallId, collected);
+}
+
 function prependCollectedFiles(
 	content: Parameters<typeof prependAgentsContent>[0],
 	files: AgentsFile[],
@@ -288,6 +319,10 @@ function prependCollectedFiles(
 	const loadedBefore = new Set(loadedPaths);
 	const result = prependAgentsContent(content, files, loadedPaths);
 	if (!result.changed) return result;
+	for (const file of files) {
+		const resolved = path.resolve(file.filepath);
+		if (!loadedBefore.has(resolved)) state.unconfirmedFiles.set(resolved, file);
+	}
 	rememberInjectedFiles(state, files, type, loadedBefore, "tool-result");
 	return result;
 }
@@ -332,6 +367,60 @@ function createSweepContext(messages: AgentMessage[], files: AgentsFile[]) {
 	return { messages: [...messages, message] };
 }
 
+function blockContainsHeader(block: unknown, header: string) {
+	if (!isObjectInput(block)) return false;
+	const text = (block as { text?: unknown }).text;
+	return typeof text === "string" && text.includes(header);
+}
+
+function messageContainsHeader(message: unknown, header: string) {
+	if (!isObjectInput(message)) return false;
+	const content = (message as MessageLike).content;
+	if (!Array.isArray(content)) return false;
+	for (const block of content) {
+		if (blockContainsHeader(block, header)) return true;
+	}
+	return false;
+}
+
+function transcriptContainsHeader(messages: readonly unknown[], header: string) {
+	const start = Math.max(0, messages.length - SWEEP_SCAN_MESSAGES);
+	for (let i = start; i < messages.length; i++) {
+		if (messageContainsHeader(messages[i], header)) return true;
+	}
+	return false;
+}
+
+/**
+ * Delivery confirmation: a tool-result injection counts as delivered only once
+ * its header is observed in the final transcript. A downstream extension that
+ * replaced the result removes the header; the file is then re-delivered through
+ * the self-healing sweep message instead.
+ */
+function reconcileUnconfirmedFiles(state: SessionState, messages: readonly unknown[]) {
+	if (state.unconfirmedFiles.size === 0) return;
+	for (const [filepath, file] of [...state.unconfirmedFiles]) {
+		state.unconfirmedFiles.delete(filepath);
+		if (!transcriptContainsHeader(messages, `Instructions from: ${filepath}`)) {
+			state.sweptFiles.push(file);
+		}
+	}
+}
+
+function isSweepMessage(message: unknown) {
+	return (
+		typeof message === "object" &&
+		message !== null &&
+		(message as { role?: unknown }).role === "custom" &&
+		(message as { customType?: unknown }).customType === SWEEP_CUSTOM_TYPE
+	);
+}
+
+/** The sweep message is rebuilt every request; a fed-back or persisted copy is replaced, never appended after. */
+function filterSweepMessages(messages: readonly AgentMessage[]) {
+	return messages.filter((message) => !isSweepMessage(message));
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.registerFlag?.(FLAG_NO_CONTEXT_FILES, {
 		description: "Disable AGENTS.md and DESIGN.md context-file injection.",
@@ -352,24 +441,34 @@ export default function (pi: ExtensionAPI) {
 	if (hasNoContextFilesFlag()) return;
 
 	pi.on("session_start", async (_event, ctx) => {
-		sessionRoot = ctx.cwd;
-		disabled = pi.getFlag?.(FLAG_NO_CONTEXT_FILES) === true;
 		clearSession(getSessionKey(ctx));
-		await recomputeManifest();
+		const state = getSessionState(getSessionKey(ctx));
+		state.root = ctx.cwd;
+		state.disabled = pi.getFlag?.(FLAG_NO_CONTEXT_FILES) === true;
+		state.manifestDirs = await computeManifestDirs(state.root);
+	});
+
+	// Pre-execution snapshot: collect applicable files while the named paths
+	// still exist, so commands that delete or move their own targets still
+	// deliver the rules that applied at execution time. Entries are consumed by
+	// the matching tool_result and the cache is bounded.
+	pi.on("tool_call", async (event, ctx) => {
+		const state = getSessionState(getSessionKey(ctx));
+		await snapshotToolCall(event, state);
 	});
 
 	// Root DESIGN.md injection: append to every agent-start system prompt.
 	pi.on("before_agent_start", async (event, ctx) => {
-		if (disabled) return;
 		const sessionKey = getSessionKey(ctx);
 		const state = getSessionState(sessionKey);
+		if (state.disabled) return;
 		state.agentStartCount += 1;
 
 		let systemPrompt = await collectRootDesignPrompt(pi, sessionKey, state, event.systemPrompt);
 
 		// Nested AGENTS.md manifest: a tool-independent index of where nested
 		// rules live, so agents discover them even when no tool input names them.
-		const manifestPrompt = appendManifestPrompt(systemPrompt ?? event.systemPrompt);
+		const manifestPrompt = appendManifestPrompt(systemPrompt ?? event.systemPrompt, state.manifestDirs);
 		if (manifestPrompt !== undefined) systemPrompt = manifestPrompt;
 
 		return systemPrompt === undefined ? undefined : { systemPrompt };
@@ -380,15 +479,20 @@ export default function (pi: ExtensionAPI) {
 	// (codex-style exec_command, MCP gateways, ...) keep nested rules flowing.
 	pi.on("tool_result", async (event, ctx) => {
 		const input = event.input;
-		if (!isUsableToolInput(disabled, event.isError, input)) return;
-
 		const sessionKey = getSessionKey(ctx);
 		const state = getSessionState(sessionKey);
+		if (!isUsableToolInput(state.disabled, event.isError, input)) return;
 
-		const targets = await resolveContainedTargets(input, sessionRoot);
+		const targets = await resolveContainedTargets(input, state.root);
 		if (targets.length === 0) return;
 
 		const { designFiles, agentsFiles } = await collectFilesForTargets(targets);
+		const snapshot = state.toolCallSnapshots.get(event.toolCallId);
+		state.toolCallSnapshots.delete(event.toolCallId);
+		if (snapshot) {
+			designFiles.unshift(...snapshot.designFiles);
+			agentsFiles.unshift(...snapshot.agentsFiles);
+		}
 
 		// DESIGN.md runs first, then AGENTS.md prepends on top of it.
 		// Result order: AGENTS.md additions → DESIGN.md additions → original file content.
@@ -405,20 +509,39 @@ export default function (pi: ExtensionAPI) {
 	// The transform is per-request and ephemeral, so accumulated files are
 	// re-appended on each request to stay visible for the rest of the session.
 	pi.on("context", async (event, ctx) => {
-		if (disabled) return;
 		const state = getSessionState(getSessionKey(ctx));
-		await sweepToolCalls(event.messages, state, sessionRoot);
+		if (state.disabled) return;
+		await sweepToolCalls(event.messages, state, state.root);
+		reconcileUnconfirmedFiles(state, event.messages);
 
 		if (state.sweptFiles.length === 0) return;
-		return createSweepContext(event.messages, state.sweptFiles);
+		return createSweepContext(filterSweepMessages(event.messages), state.sweptFiles);
 	});
 
-	pi.on("session_compact", (_event, ctx) => {
-		clearSession(getSessionKey(ctx));
-		void recomputeManifest();
+	pi.on("session_compact", async (_event, ctx) => {
+		const state = getSessionState(getSessionKey(ctx));
+		// Compaction clears delivered-file memory but keeps the session's root
+		// and flag state; the manifest is refreshed in place.
+		state.loadedAgentsPaths.clear();
+		state.loadedDesignPaths.clear();
+		state.injectedFiles.clear();
+		state.sweptFiles.length = 0;
+		state.sweptToolCallIds.clear();
+		state.toolCallSnapshots.clear();
+		state.unconfirmedFiles.clear();
+		state.manifestDirs = await computeManifestDirs(state.root);
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
-		clearSession(getSessionKey(ctx));
+		// Shutdown clears delivered-file memory for the key but keeps root and
+		// flag state: a replacement session_start reinitializes everything.
+		const state = getSessionState(getSessionKey(ctx));
+		state.loadedAgentsPaths.clear();
+		state.loadedDesignPaths.clear();
+		state.injectedFiles.clear();
+		state.sweptFiles.length = 0;
+		state.sweptToolCallIds.clear();
+		state.toolCallSnapshots.clear();
+		state.unconfirmedFiles.clear();
 	});
 }

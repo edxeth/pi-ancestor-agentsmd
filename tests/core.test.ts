@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, test, beforeAll } from "bun:test";
@@ -221,6 +221,16 @@ describe("collectRecursiveAgents", () => {
 		]);
 	});
 
+	test("starts at a directory target when the input has a trailing separator", async () => {
+		const cwd = "/repo";
+		const filepath = path.resolve("/repo/nested/AGENTS.md");
+		const results = await collectRecursiveAgents("nested/", cwd, async (candidate) => {
+			return candidate === filepath ? "nested rules\n" : "";
+		});
+
+		expect(results).toEqual([expect.objectContaining({ filepath, content: "nested rules\n" })]);
+	});
+
 	test("ignores targets outside cwd", async () => {
 		const results = await collectRecursiveAgents("/outside/project/file.ts", "/repo", async () => "should not load");
 		expect(results).toEqual([]);
@@ -375,5 +385,119 @@ describe("prependAgentsContent", () => {
 		);
 
 		expect(result).toEqual({ content, changed: false });
+	});
+});
+
+describe("instruction file containment (symlinks)", () => {
+	const readReal = async (filepath: string) => {
+		try {
+			return await readFile(filepath, "utf8");
+		} catch {
+			return "";
+		}
+	};
+
+	test("rejects an AGENTS.md symlink resolving outside the session root", async () => {
+		const outside = await realpath(await mkdtemp(path.join(tmpdir(), "paa-out-")));
+		await writeFile(path.join(outside, "rules.md"), "OUTSIDE_RULES");
+		const root = await realpath(await mkdtemp(path.join(tmpdir(), "paa-sym-")));
+		await mkdir(path.join(root, "src"), { recursive: true });
+		await writeFile(path.join(root, "src", "file.ts"), "x");
+		await symlink(path.join(outside, "rules.md"), path.join(root, "src", "AGENTS.md"));
+		try {
+			const files = await collectRecursiveAgents("src/file.ts", root, readReal);
+			expect(files).toEqual([]);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+			await rm(outside, { recursive: true, force: true });
+		}
+	});
+
+	test("allows an AGENTS.md symlink resolving inside the session root", async () => {
+		const root = await realpath(await mkdtemp(path.join(tmpdir(), "paa-sym-")));
+		await mkdir(path.join(root, "src"), { recursive: true });
+		await writeFile(path.join(root, "src", "file.ts"), "x");
+		await writeFile(path.join(root, "shared-agents.md"), "INSIDE_RULES");
+		await symlink(path.join(root, "shared-agents.md"), path.join(root, "src", "AGENTS.md"));
+		try {
+			const files = await collectRecursiveAgents("src/file.ts", root, readReal);
+			expect(files.map((file) => file.content)).toContain("INSIDE_RULES");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("contains candidates against a symlinked session root", async () => {
+		const realRoot = await realpath(await mkdtemp(path.join(tmpdir(), "paa-sym-")));
+		await mkdir(path.join(realRoot, "pkg"), { recursive: true });
+		await writeFile(path.join(realRoot, "pkg", "AGENTS.md"), "PKG_RULES");
+		await writeFile(path.join(realRoot, "pkg", "file.ts"), "x");
+		const linkRoot = realRoot + "-link";
+		await symlink(realRoot, linkRoot);
+		try {
+			const files = await collectRecursiveAgents("pkg/file.ts", linkRoot, readReal);
+			expect(files.map((file) => file.content)).toContain("PKG_RULES");
+		} finally {
+			await rm(linkRoot);
+			await rm(realRoot, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("resolveContainedPath missing-target fallback", () => {
+	test("falls back to the nearest existing ancestor for a deleted target", async () => {
+		const root = await realpath(await mkdtemp(path.join(tmpdir(), "paa-fb-")));
+		await mkdir(path.join(root, "pkg"), { recursive: true });
+		await writeFile(path.join(root, "pkg", "AGENTS.md"), "rules");
+		try {
+			const resolved = await resolveContainedPath("pkg/gone.ts", root);
+			expect(resolved?.target).toBe(path.join(root, "pkg"));
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("falls back to the directory for a glob-shaped target", async () => {
+		const root = await realpath(await mkdtemp(path.join(tmpdir(), "paa-fb-")));
+		await mkdir(path.join(root, "pkg"), { recursive: true });
+		await writeFile(path.join(root, "pkg", "AGENTS.md"), "rules");
+		try {
+			const resolved = await resolveContainedPath("pkg/*.ts", root);
+			expect(resolved?.target).toBe(path.join(root, "pkg"));
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("falls back across a chain of missing directories", async () => {
+		const root = await realpath(await mkdtemp(path.join(tmpdir(), "paa-fb-")));
+		await mkdir(path.join(root, "pkg"), { recursive: true });
+		try {
+			const resolved = await resolveContainedPath("pkg/a/b/c.ts", root);
+			expect(resolved?.target).toBe(path.join(root, "pkg"));
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("returns null when the climb lands on the session root", async () => {
+		const root = await realpath(await mkdtemp(path.join(tmpdir(), "paa-fb-")));
+		try {
+			expect(await resolveContainedPath("definitely-missing.ts", root)).toBeNull();
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("returns null when the surviving ancestor resolves outside the root", async () => {
+		const outside = await realpath(await mkdtemp(path.join(tmpdir(), "paa-fb-out-")));
+		const root = await realpath(await mkdtemp(path.join(tmpdir(), "paa-fb-")));
+		await symlink(outside, path.join(root, "pkg-link"));
+		try {
+			expect(await resolveContainedPath("pkg-link/gone.ts", root)).toBeNull();
+		} finally {
+			await rm(root, { recursive: true, force: true });
+			await rm(outside, { recursive: true, force: true });
+		}
 	});
 });
