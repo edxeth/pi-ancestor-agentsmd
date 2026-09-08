@@ -278,7 +278,7 @@ describe("extension integration", () => {
 		const tree = await makeTree({
 			"src/AGENTS.md": "agent rules",
 			"src/DESIGN.md": "design rules",
-			"src/file.ts": "file content",
+			"src/file.ts": "TARGET_FILE_BODY",
 		});
 		try {
 			const extension = await loadExtension();
@@ -290,12 +290,12 @@ describe("extension integration", () => {
 				type: "tool_result",
 				toolName: "filesystem_gateway",
 				input: { file_path: "src/file.ts" },
-				content: [{ type: "text", text: "file content" }],
+				content: [{ type: "text", text: "TARGET_FILE_BODY" }],
 				isError: false,
 			});
 			const text = contentText(result);
 			expect(text.indexOf("agent rules")).toBeLessThan(text.indexOf("design rules"));
-			expect(text.indexOf("design rules")).toBeLessThan(text.indexOf("file content"));
+			expect(text.indexOf("design rules")).toBeLessThan(text.indexOf("TARGET_FILE_BODY"));
 		} finally {
 			if (previous === undefined) delete process.env.PI_ANCESTOR_DESIGN_MD;
 			else process.env.PI_ANCESTOR_DESIGN_MD = previous;
@@ -590,9 +590,10 @@ describe("extension integration", () => {
 		}
 	});
 
-	test("records when a tool-result context file was truncated", async () => {
+	test("records complete delivery for a large tool-result context file", async () => {
+		const content = "x".repeat(32 * 1024 + 1) + "FINAL_RULE";
 		const tree = await makeTree({
-			"src/AGENTS.md": "x".repeat(32 * 1024 + 1),
+			"src/AGENTS.md": content,
 			"src/file.ts": "x",
 		});
 		try {
@@ -600,11 +601,12 @@ describe("extension integration", () => {
 			const fake = makeFakePi(tree.root);
 			extension(fake.pi as unknown as ExtensionAPI);
 			await fake.emit("session_start", {});
-			await fake.emit("tool_result", readEvent(tree.path("src/file.ts")));
+			const result = await fake.emit("tool_result", readEvent(tree.path("src/file.ts")));
 			await fake.runCommand("nested-context-files");
 
+			expect(contentText(result).includes(content)).toBe(true);
 			expect(lastEntry(fake.entries)?.data).toMatchObject({
-				files: [expect.objectContaining({ filepath: tree.path("src/AGENTS.md"), truncated: true })],
+				files: [expect.objectContaining({ filepath: tree.path("src/AGENTS.md"), truncated: false })],
 			});
 		} finally {
 			await tree.cleanup();
@@ -645,7 +647,7 @@ describe("extension integration", () => {
 			const swept = first.messages[first.messages.length - 1] as { role: string; content: string; display: boolean };
 			expect(swept.role).toBe("custom");
 			expect(swept.display).toBe(false);
-			expect(swept.content).toContain("Instructions from:");
+			expect(swept.content).toContain("<project_instructions");
 			expect(swept.content).toContain("tests rules");
 
 			// The transform is per-request; a fed-back sweep message is replaced by
@@ -873,7 +875,9 @@ describe("extension integration", () => {
 			expect(result.systemPrompt).toContain("base prompt");
 			expect(result.systemPrompt).toContain("frontend/AGENTS.md");
 			expect(result.systemPrompt).toContain("docs/guide/AGENTS.md");
-			expect(result.systemPrompt).toContain("Before reading or editing files under any of these paths");
+			expect(result.systemPrompt).toContain("ensure the applicable AGENTS.md instructions are loaded");
+			expect(result.systemPrompt).toContain("Complete injected contents satisfy this requirement");
+			expect(result.systemPrompt).not.toContain("read the applicable AGENTS.md first");
 			// Root is loaded by pi itself; dependency noise stays out.
 			expect(result.systemPrompt).not.toContain("- AGENTS.md\n");
 			expect(result.systemPrompt).not.toContain("node_modules");
@@ -973,6 +977,74 @@ describe("extension integration", () => {
 		}
 	});
 });
+
+for (const channel of ["tool-result", "context-sweep"] as const) {
+	test(`injects every complete ancestor AGENTS.md and DESIGN.md through ${channel} without byte limits`, async () => {
+		const previous = process.env.PI_ANCESTOR_DESIGN_MD;
+		process.env.PI_ANCESTOR_DESIGN_MD = "1";
+		const files: Record<string, string> = {};
+		for (let depth = 1; depth <= 6; depth++) {
+			const directory = Array.from({ length: depth }, (_, index) => `level${index}`).join("/");
+			for (const filename of ["AGENTS.md", "DESIGN.md"]) {
+				files[`${directory}/${filename}`] = `START-${depth}-${filename}\n${"é😀�\n".repeat(6000)}END-${depth}-${filename}`;
+			}
+		}
+		const target = "level0/level1/level2/level3/level4/level5/file.ts";
+		const tree = await makeTree({ ...files, [target]: "TARGET_FILE_BODY" });
+		try {
+			const extension = await loadExtension();
+			const fake = makeFakePi(tree.root);
+			// SAFETY: makeFakePi implements the extension methods used by this integration boundary.
+			extension(fake.pi as unknown as ExtensionAPI);
+			await fake.emit("session_start", {});
+
+			let text: string;
+			if (channel === "tool-result") {
+				text = contentText(await fake.emit("tool_result", readEvent(tree.path(target))));
+			} else {
+				// SAFETY: This narrows the actual context handler's returned messages at the fake API boundary.
+				const result = await fake.emit("context", {
+					messages: [{ role: "assistant", content: [{ type: "toolCall", id: "full-files", arguments: { path: target } }] }],
+				}) as { messages: Array<{ content: string }> };
+				text = result.messages.at(-1)?.content ?? "";
+			}
+
+			expect(text.match(/<project_instructions /g)).toHaveLength(12);
+			for (const content of Object.values(files)) {
+				expect(text.includes(`<file_content>\n${content}\n</file_content>`)).toBe(true);
+			}
+			expect(text).not.toContain("Only partial file contents");
+			expect(text).not.toContain("Content was truncated");
+			expect(text).toContain("complete file contents are already loaded");
+		} finally {
+			if (previous === undefined) delete process.env.PI_ANCESTOR_DESIGN_MD;
+			else process.env.PI_ANCESTOR_DESIGN_MD = previous;
+			await tree.cleanup();
+		}
+	});
+}
+
+test("injects a complete large root DESIGN.md into the system prompt", async () => {
+	const previous = process.env.PI_ROOT_DESIGN_MD;
+	process.env.PI_ROOT_DESIGN_MD = "1";
+	const content = "ROOT_DESIGN_START\n" + "é😀�\n".repeat(20000) + "ROOT_DESIGN_END";
+	const tree = await makeTree({ "DESIGN.md": content });
+	try {
+		const extension = await loadExtension();
+		const fake = makeFakePi(tree.root);
+		// SAFETY: makeFakePi implements the extension methods used by this integration boundary.
+		extension(fake.pi as unknown as ExtensionAPI);
+		await fake.emit("session_start", {});
+		// SAFETY: With a readable root DESIGN.md enabled, the handler returns its augmented system prompt.
+		const result = await fake.emit("before_agent_start", { systemPrompt: "base" }) as { systemPrompt: string };
+		expect(result.systemPrompt.includes(content)).toBe(true);
+	} finally {
+		if (previous === undefined) delete process.env.PI_ROOT_DESIGN_MD;
+		else process.env.PI_ROOT_DESIGN_MD = previous;
+		await tree.cleanup();
+	}
+});
+
 
 test("isolates session roots across overlapping sessions", async () => {
 	const treeA = await makeTree({ "pkg/AGENTS.md": "A_RULES", "pkg/file.ts": "a", "other/AGENTS.md": "A_OTHER_RULES", "other/file.ts": "x" });
@@ -1223,7 +1295,7 @@ test("does not re-deliver a tool-result injection after its header reaches the t
 			{
 				role: "toolResult",
 				toolCallId: "call-confirm",
-				content: [{ type: "text", text: `Instructions from: ${tree.path("pkg/AGENTS.md")}\nPKG_RULES` }],
+				content: [{ type: "text", text: contentText(injected) }],
 			},
 		];
 
@@ -1361,6 +1433,30 @@ test("clears pending sweep files during shutdown", async () => {
 
 		await fake.emit("session_shutdown", {});
 		expect(await fake.emit("context", { messages: [] })).toBeUndefined();
+	} finally {
+		await tree.cleanup();
+	}
+});
+
+test("uses the same complete scoped envelope for tool results and fallback context", async () => {
+	const tree = await makeTree({ "pkg/AGENTS.md": "Package-only rules", "pkg/file.ts": "x" });
+	try {
+		const extension = await loadExtension();
+		const normal = makeFakePi(tree.root, { sessionFile: "/tmp/envelope-normal.jsonl" });
+		const fallback = makeFakePi(tree.root, { sessionFile: "/tmp/envelope-fallback.jsonl" });
+		extension(normal.pi as unknown as ExtensionAPI);
+		extension(fallback.pi as unknown as ExtensionAPI);
+		await normal.emit("session_start", {});
+		await fallback.emit("session_start", {});
+		const injected = await normal.emit("tool_result", readEvent(tree.path("pkg/file.ts")));
+		// SAFETY: The actual context handler returns messages; this narrows the fake API's unknown event boundary.
+		const swept = await fallback.emit("context", {
+			messages: [{ role: "assistant", content: [{ type: "toolCall", id: "envelope-read", arguments: { path: "pkg/file.ts" } }] }],
+		}) as { messages: Array<{ role: string; content: string }> };
+		const envelope = swept.messages.at(-1)?.content;
+		expect(envelope).toContain("complete file contents are already loaded");
+		expect(envelope).toContain('scope="' + tree.path("pkg") + path.sep + '"');
+		expect(contentText(injected)).toBe(envelope + "\nfile content");
 	} finally {
 		await tree.cleanup();
 	}

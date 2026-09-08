@@ -1,20 +1,15 @@
 import { access, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import { formatInstructions } from "./instructions.js";
 
 export type AgentsFile = {
 	filepath: string;
 	content: string;
-	truncated?: boolean;
-	originalBytes?: number;
-	injectedBytes?: number;
 };
 
 const AGENTS_FILENAMES = ["AGENTS.md"];
 const DESIGN_FILENAMES = ["DESIGN.md"];
-export const DEFAULT_MAX_BYTES_PER_FILE = 32 * 1024;
-export const DEFAULT_MAX_BYTES_PER_READ = 128 * 1024;
-const REPLACEMENT_CHAR = "\uFFFD";
 
 export function hasNoContextFilesFlag(argv = process.argv) {
 	return argv.includes("--no-context-files") || argv.includes("-nc");
@@ -181,87 +176,20 @@ export async function resolveContainedPath(filepath: string, cwd: string) {
 	return { root: canonicalRoot, target: canonicalTarget };
 }
 
-export type TruncationResult = {
-	content: string;
-	truncated: boolean;
-	originalBytes: number;
-	injectedBytes: number;
-};
-
-export function truncateForContext(content: string, maxBytes: number, filepath?: string): TruncationResult {
-	const encoder = new TextEncoder();
-	const bytes = encoder.encode(content);
-	if (bytes.byteLength <= maxBytes) {
-		return { content, truncated: false, originalBytes: bytes.byteLength, injectedBytes: bytes.byteLength };
-	}
-
-	const decoder = new TextDecoder("utf-8", { fatal: false });
-	let decoded = decoder.decode(bytes.subarray(0, Math.max(0, maxBytes)));
-	while (decoded.endsWith(REPLACEMENT_CHAR)) {
-		decoded = decoded.slice(0, -1);
-	}
-
-	const notice = filepath
-		? `\n\n[Note: Content was truncated to save context window space. For full context, please read the file directly: ${filepath}]`
-		: "";
-	const truncatedContent = `${decoded}${notice}`;
-	return {
-		content: truncatedContent,
-		truncated: true,
-		originalBytes: bytes.byteLength,
-		injectedBytes: encoder.encode(truncatedContent).byteLength,
-	};
-}
-
-type CollectOptions = {
-	filenames?: string[];
-	maxBytesPerFile?: number;
-	maxBytesPerRead?: number;
-};
-
-type ResolvedCollectOptions = {
-	filenames: string[];
-	maxBytesPerFile: number;
-	maxBytesPerRead: number;
-};
-
-function resolveCollectOptions(filenamesOrOptions: string[] | CollectOptions): ResolvedCollectOptions {
-	const options = Array.isArray(filenamesOrOptions) ? { filenames: filenamesOrOptions } : filenamesOrOptions;
-	return {
-		filenames: options.filenames ?? AGENTS_FILENAMES,
-		maxBytesPerFile: options.maxBytesPerFile ?? DEFAULT_MAX_BYTES_PER_FILE,
-		maxBytesPerRead: options.maxBytesPerRead ?? DEFAULT_MAX_BYTES_PER_READ,
-	};
-}
-
-type InstructionFileResult = { file?: AgentsFile; remainingBytes: number };
-
 async function readContainedInstructionFile(
 	candidate: string,
 	root: string,
-	maxBytesPerFile: number,
-	remainingBytes: number,
 	readText: (filepath: string) => Promise<string>,
-): Promise<InstructionFileResult> {
+): Promise<AgentsFile | undefined> {
 	// Canonicalize the instruction file itself: a symlink resolving outside the
 	// canonical session root is rejected instead of read.
 	const canonical = await realpath(candidate).catch(() => null);
-	if (canonical !== null && !isWithinRoot(canonical, root)) return { remainingBytes };
+	if (canonical !== null && !isWithinRoot(canonical, root)) return undefined;
 
-	const rawContent = await readText(canonical ?? candidate);
-	if (!rawContent) return { remainingBytes };
+	const content = await readText(canonical ?? candidate);
+	if (!content) return undefined;
 
-	const truncated = truncateForContext(rawContent, Math.min(maxBytesPerFile, remainingBytes), candidate);
-	return {
-		file: {
-			filepath: candidate,
-			content: truncated.content,
-			truncated: truncated.truncated,
-			originalBytes: truncated.originalBytes,
-			injectedBytes: truncated.injectedBytes,
-		},
-		remainingBytes: remainingBytes - truncated.injectedBytes,
-	};
+	return { filepath: candidate, content };
 }
 
 async function collectDirectoryFiles(
@@ -269,19 +197,16 @@ async function collectDirectoryFiles(
 	target: string,
 	root: string,
 	filenames: string[],
-	maxBytesPerFile: number,
-	remainingBytes: number,
 	readText: (filepath: string) => Promise<string>,
-): Promise<{ files: AgentsFile[]; remainingBytes: number }> {
+): Promise<AgentsFile[]> {
 	const files: AgentsFile[] = [];
 	for (const filename of filenames) {
 		const candidate = path.resolve(path.join(current, filename));
 		if (candidate === target) continue;
-		const result = await readContainedInstructionFile(candidate, root, maxBytesPerFile, remainingBytes, readText);
-		if (result.file) files.push(result.file);
-		remainingBytes = result.remainingBytes;
+		const file = await readContainedInstructionFile(candidate, root, readText);
+		if (file) files.push(file);
 	}
-	return { files, remainingBytes };
+	return files;
 }
 
 /**
@@ -289,15 +214,17 @@ async function collectDirectoryFiles(
  * collecting any files matching the given filenames at each level.
  * The target file itself is always skipped. Results are closest-first to match OpenCode:
  * the most specific directory instructions are injected before broader ones.
+ * File contents and the ancestor collection are never truncated by size.
  */
 export async function collectRecursive(
 	filepath: string,
 	cwd: string,
 	readText: (filepath: string) => Promise<string>,
-	filenamesOrOptions: string[] | CollectOptions = AGENTS_FILENAMES,
+	filenamesOrOptions: string[] | { filenames?: string[] } = AGENTS_FILENAMES,
 ): Promise<AgentsFile[]> {
-	const options = resolveCollectOptions(filenamesOrOptions);
-	let remainingBytes = options.maxBytesPerRead;
+	const filenames = Array.isArray(filenamesOrOptions)
+		? filenamesOrOptions
+		: filenamesOrOptions.filenames ?? AGENTS_FILENAMES;
 	const root = await realpath(path.resolve(cwd)).catch(() => path.resolve(cwd));
 	const target = path.resolve(cwd, filepath);
 	// Canonicalize the walk anchor so symlinked roots (e.g. /tmp on macOS) compare
@@ -308,18 +235,15 @@ export async function collectRecursive(
 	let current = filepath.endsWith(path.sep) ? canonicalTarget : path.dirname(canonicalTarget);
 	const results: AgentsFile[] = [];
 
-	while (current !== root && isWithinRoot(current, root) && remainingBytes > 0) {
+	while (current !== root && isWithinRoot(current, root)) {
 		const directory = await collectDirectoryFiles(
 			current,
 			canonicalTarget,
 			root,
-			options.filenames,
-			options.maxBytesPerFile,
-			remainingBytes,
+			filenames,
 			readText,
 		);
-		results.push(...directory.files);
-		remainingBytes = directory.remainingBytes;
+		results.push(...directory);
 
 		const parent = path.dirname(current);
 		if (parent === current) break;
@@ -360,7 +284,7 @@ export function prependAgentsContent(
 		loadedPaths.add(resolved);
 		additions.push({
 			type: "text",
-			text: `Instructions from: ${resolved}\n${item.content}`,
+			text: formatInstructions(item),
 		});
 	}
 

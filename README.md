@@ -44,8 +44,15 @@ A few rules keep that behavior sane:
 - the session root `AGENTS.md` is not re-added, because pi already loaded it at startup
 - each injected file is only added once per session, then becomes eligible again after compaction/restart
 - symlink escapes outside the session root are rejected
-- large context files are truncated safely
+- context files are always injected in full, without per-file or collection byte limits
 - `--no-context-files` disables the entire extension
+
+
+Injected files use a paired `<project_instructions path="…" scope="…">` block. The scope identifies the directory subtree, while the contents can restrict individual rules to specific files or conditions. Every block contains the full file and states that its contents are already loaded. The same format is used for tool results and fallback context, without a `content_status` attribute or a partial-content branch.
+
+The extension does not shorten context files to fit the model context window. Large instruction sets consume their full token cost.
+
+The startup manifest accepts complete injected contents as loaded instructions. A separate read is not required just to load them again. Injection still occurs after tool execution, so this format does not enforce instruction delivery before a first write.
 
 #### Transcript sweep (defense in depth)
 

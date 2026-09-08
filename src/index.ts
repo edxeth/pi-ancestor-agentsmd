@@ -3,6 +3,7 @@ import path from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { extractPathCandidates } from "./extract.js";
+import { formatInstructions, instructionHeader } from "./instructions.js";
 import {
 	collectNestedAgentsDirs,
 	collectRecursiveAgents,
@@ -123,7 +124,7 @@ function rememberInjectedFiles(
 		state.injectedFiles.set(resolved, {
 			filepath: resolved,
 			type,
-			truncated: file.truncated === true,
+			truncated: false,
 			mode,
 			injectionCount: 1,
 		});
@@ -243,7 +244,7 @@ function appendManifestPrompt(basePrompt: string, manifestDirs: string[]) {
 	const listing = manifestDirs.map((dir) => `- ${dir.split(path.sep).join("/")}/AGENTS.md`).join("\n");
 	return (
 		basePrompt +
-		`\n\n## Nested AGENTS.md files\n\nAdditional AGENTS.md instructions exist in these directories under this project:\n${listing}\n\nBefore reading or editing files under any of these paths, read the applicable AGENTS.md first.\n`
+		`\n\n## Nested AGENTS.md files\n\nAdditional AGENTS.md instructions exist in these directories under this project:\n${listing}\n\nBefore working under any of these paths, ensure the applicable AGENTS.md instructions are loaded. Complete injected contents satisfy this requirement; do not reread them solely to load instructions.\n`
 	);
 }
 
@@ -356,7 +357,7 @@ async function sweepToolCalls(messages: readonly unknown[], state: SessionState,
 }
 
 function createSweepContext(messages: AgentMessage[], files: AgentsFile[]) {
-	const text = files.map((file) => `Instructions from: ${file.filepath}\n${file.content}`).join("\n\n");
+	const text = files.map(formatInstructions).join("\n\n");
 	const message: AgentMessage = {
 		role: "custom",
 		customType: SWEEP_CUSTOM_TYPE,
@@ -401,7 +402,7 @@ function reconcileUnconfirmedFiles(state: SessionState, messages: readonly unkno
 	if (state.unconfirmedFiles.size === 0) return;
 	for (const [filepath, file] of [...state.unconfirmedFiles]) {
 		state.unconfirmedFiles.delete(filepath);
-		if (!transcriptContainsHeader(messages, `Instructions from: ${filepath}`)) {
+		if (!transcriptContainsHeader(messages, instructionHeader(filepath))) {
 			state.sweptFiles.push(file);
 		}
 	}

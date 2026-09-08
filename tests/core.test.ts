@@ -14,7 +14,6 @@ import {
 	isNestedAgentsManifestEnabled,
 	prependAgentsContent,
 	resolveContainedPath,
-	truncateForContext,
 } from "../src/core.js";
 
 describe("hasNoContextFilesFlag", () => {
@@ -237,58 +236,53 @@ describe("collectRecursiveAgents", () => {
 	});
 });
 
-describe("collectRecursive limits", () => {
-	test("truncates without splitting multi-byte characters", () => {
-		const result = truncateForContext("ab😀cd", 5, "/repo/AGENTS.md");
+describe("complete context-file collection", () => {
+	test("preserves all Unicode contents of files larger than the former per-file limit", async () => {
+		const filepath = path.resolve("/repo/nested/AGENTS.md");
+		const content = "ab😀�cd\n".repeat(12000) + "FINAL_RULE";
+		const results = await collectRecursiveAgents("nested/file.ts", "/repo", async (candidate) =>
+			candidate === filepath ? content : "",
+		);
 
-		expect(result.truncated).toBe(true);
-		expect(result.content).toStartWith("ab");
-		expect(result.content).not.toContain("�");
-		expect(result.content).toContain("please read the file directly: /repo/AGENTS.md");
+		expect(results).toHaveLength(1);
+		expect(results[0]?.content === content).toBe(true);
 	});
 
-	test("does not mark content truncated when it exactly fits the byte limit", () => {
-		expect(truncateForContext("abc", 3)).toEqual({
-			content: "abc",
-			truncated: false,
-			originalBytes: 3,
-			injectedBytes: 3,
+	test("does not omit ancestors when their combined contents exceed the former collection limit", async () => {
+		const expected = Array.from({ length: 6 }, (_, index) => {
+			const directory = Array.from({ length: 6 - index }, (_, depth) => `level${depth}`).join("/");
+			return {
+				filepath: path.resolve("/repo", directory, "AGENTS.md"),
+				content: `RULE-${index}\n${"x".repeat(40 * 1024)}\nFINAL-${index}`,
+			};
 		});
+		const byPath = new Map(expected.map((file) => [file.filepath, file.content]));
+		const results = await collectRecursiveAgents(
+			"level0/level1/level2/level3/level4/level5/file.ts",
+			"/repo",
+			async (filepath) => byPath.get(filepath) ?? "",
+		);
+
+		expect(results.map((file) => file.filepath)).toEqual(expected.map((file) => file.filepath));
+		for (const [index, file] of results.entries()) {
+			expect(file.content === expected[index]?.content).toBe(true);
+		}
 	});
 
-	test("uses an empty prefix when truncation has no available bytes", () => {
-		expect(truncateForContext("abc", 0)).toEqual({
-			content: "",
-			truncated: true,
-			originalBytes: 3,
-			injectedBytes: 0,
+	test("preserves all context types in the same directory", async () => {
+		const content = "x".repeat(150 * 1024) + "FINAL_RULE";
+		const results = await collectRecursive("nested/file.ts", "/repo", async () => content, {
+			filenames: ["AGENTS.md", "DESIGN.md"],
 		});
+
+		expect(results.map((file) => path.basename(file.filepath))).toEqual(["AGENTS.md", "DESIGN.md"]);
+		expect(results.every((file) => file.content === content)).toBe(true);
 	});
 
-	test("honors the total per-read byte budget across multiple files", async () => {
-		const cwd = "/repo";
-		const map = new Map([
-			[path.resolve("/repo/a/AGENTS.md"), "12345"],
-			[path.resolve("/repo/a/b/AGENTS.md"), "67890"],
-		]);
-
-		const results = await collectRecursive("a/b/file.ts", cwd, async (filepath) => map.get(filepath) ?? "", {
-			filenames: ["AGENTS.md"],
-			maxBytesPerFile: 5,
-			maxBytesPerRead: 5,
-		});
-
-		expect(results).toEqual([expect.objectContaining({ filepath: path.resolve("/repo/a/b/AGENTS.md") })]);
-	});
-
-	test("walks once when the total read budget is one byte", async () => {
-		const cwd = "/repo";
-		const filepath = path.resolve("/repo/a/AGENTS.md");
-		const results = await collectRecursive("a/file.ts", cwd, async (candidate) => (candidate === filepath ? "rules" : ""), {
-			maxBytesPerRead: 1,
-		});
-
-		expect(results).toEqual([expect.objectContaining({ filepath })]);
+	test("retains the default filename when collection options are empty", async () => {
+		const filepath = path.resolve("/repo/nested/AGENTS.md");
+		const results = await collectRecursive("nested/file.ts", "/repo", async () => "rules", {});
+		expect(results).toEqual([{ filepath, content: "rules" }]);
 	});
 });
 
@@ -357,7 +351,14 @@ describe("prependAgentsContent", () => {
 			content: [
 				{
 					type: "text",
-					text: `Instructions from: ${path.resolve("/repo/nested/deeper/AGENTS.md")}\ndeep rules\n`,
+					text: `<project_instructions path="${path.resolve("/repo/nested/deeper/AGENTS.md")}" scope="${path.resolve("/repo/nested/deeper") + path.sep}">
+The complete file contents are already loaded below. No separate read is needed unless checking for changes.
+Apply these instructions within the stated subtree, respecting narrower conditions and exceptions in the contents. More-specific repository instructions override conflicting broader repository guidance.
+<file_content>
+deep rules
+
+</file_content>
+</project_instructions>`,
 				},
 				{ type: "text", text: "target file\n" },
 			],
