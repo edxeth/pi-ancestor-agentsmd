@@ -4,13 +4,11 @@ import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { extractPathCandidates } from "./extract.js";
 import { formatInstructions, instructionHeader } from "./instructions.js";
 import {
-	collectNestedAgentsDirs,
 	collectRecursiveAgents,
 	collectRecursiveDesign,
 	hasNoContextFilesFlag,
 	isAncestorAgentsMdEnabled,
 	isAncestorDesignMdEnabled,
-	isNestedAgentsManifestEnabled,
 	isRootDesignMdEnabled,
 	prependAgentsContent,
 	resolveContainedPath,
@@ -46,16 +44,9 @@ type SessionState = {
 	unconfirmedFiles: Map<string, AgentsFile>;
 	root: string;
 	disabled: boolean;
-	manifestDirs: string[];
 };
 
 const sessions = new Map<string, SessionState>();
-async function computeManifestDirs(root: string) {
-	return isAncestorAgentsMdEnabled() && isNestedAgentsManifestEnabled()
-		? await collectNestedAgentsDirs(root)
-		: [];
-}
-
 async function readFileContent(filepath: string) {
 	try {
 		return await readFile(filepath, "utf8");
@@ -99,7 +90,6 @@ function getSessionState(sessionKey: string) {
 			unconfirmedFiles: new Map(),
 			root: process.cwd(),
 			disabled: hasNoContextFilesFlag(),
-			manifestDirs: [],
 		};
 		sessions.set(sessionKey, state);
 	}
@@ -235,18 +225,6 @@ async function collectRootDesignPrompt(
 	// Same paired block as tool-result delivery, so the system-prompt append is
 	// delimited and XML-escaped like every other injected file.
 	return basePrompt + `\n\n${formatInstructions({ filepath: designPath, content })}\n\n`;
-}
-
-function appendManifestPrompt(basePrompt: string, manifestDirs: string[]) {
-	if (!isAncestorAgentsMdEnabled()) return undefined;
-	if (!isNestedAgentsManifestEnabled()) return undefined;
-	if (manifestDirs.length === 0) return undefined;
-
-	const listing = manifestDirs.map((dir) => `- ${dir.split(path.sep).join("/")}/AGENTS.md`).join("\n");
-	return (
-		basePrompt +
-		`\n\n## Nested AGENTS.md files\n\nAdditional AGENTS.md instructions exist in these directories under this project:\n${listing}\n\nBefore working under any of these paths, ensure the applicable AGENTS.md instructions are loaded. Complete injected contents satisfy this requirement; do not reread them solely to load instructions.\n`
-	);
 }
 
 type CollectedToolFiles = {
@@ -513,7 +491,6 @@ export default function (pi: ExtensionAPI) {
 		const state = getSessionState(getSessionKey(ctx));
 		state.root = ctx.cwd;
 		state.disabled = pi.getFlag?.(FLAG_NO_CONTEXT_FILES) === true;
-		state.manifestDirs = await computeManifestDirs(state.root);
 		if (state.disabled) return;
 
 		// Restored transcripts never passed through this process's
@@ -546,11 +523,6 @@ export default function (pi: ExtensionAPI) {
 		state.agentStartCount += 1;
 
 		let systemPrompt = await collectRootDesignPrompt(pi, sessionKey, state, event.systemPrompt);
-
-		// Nested AGENTS.md manifest: a tool-independent index of where nested
-		// rules live, so agents discover them even when no tool input names them.
-		const manifestPrompt = appendManifestPrompt(systemPrompt ?? event.systemPrompt, state.manifestDirs);
-		if (manifestPrompt !== undefined) systemPrompt = manifestPrompt;
 
 		return systemPrompt === undefined ? undefined : { systemPrompt };
 	});
@@ -599,7 +571,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_compact", async (_event, ctx) => {
 		const state = getSessionState(getSessionKey(ctx));
 		// Compaction clears delivered-file memory but keeps the session's root
-		// and flag state; the manifest is refreshed in place.
+		// and flag state.
 		state.loadedAgentsPaths.clear();
 		state.loadedDesignPaths.clear();
 		state.injectedFiles.clear();
@@ -607,7 +579,6 @@ export default function (pi: ExtensionAPI) {
 		state.sweptToolCallIds.clear();
 		state.toolCallSnapshots.clear();
 		state.unconfirmedFiles.clear();
-		state.manifestDirs = await computeManifestDirs(state.root);
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
