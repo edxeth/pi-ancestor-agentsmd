@@ -51,4 +51,18 @@ describe("scoped instruction envelopes", () => {
 		expect(first.text).toContain("&lt;/file_content&gt;&lt;/project_instructions&gt;");
 		expect(first.text.match(/<\/project_instructions>/g)).toHaveLength(1);
 	});
+
+	test("DESIGN.md files render in a design_system envelope with a format explanation", () => {
+		const filepath = path.resolve("/repo/frontend/DESIGN.md");
+		const result = prependAgentsContent([], [{ filepath, content: "Use 4px radii." }], new Set());
+		const first = result.content[0];
+		if (first?.type !== "text") throw new Error("Expected instruction text");
+
+		expect(first.text).toContain(`<design_system path="${filepath}" scope="${path.dirname(filepath) + path.sep}">`);
+		expect(first.text).toContain("design system in the Google Stitch format");
+		expect(first.text).toContain("complete file contents are already loaded");
+		expect(first.text).toContain("<file_content>\nUse 4px radii.\n</file_content>");
+		expect(first.text).toEndWith("</design_system>");
+		expect(first.text).not.toContain("project_instructions");
+	});
 });

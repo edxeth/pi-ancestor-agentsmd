@@ -488,6 +488,10 @@ describe("extension integration", () => {
 
 			const first = await fake.emit("before_agent_start", { systemPrompt: "base prompt" });
 			const second = await fake.emit("before_agent_start", { systemPrompt: "next prompt" });
+			// Capture the prompt before toMatchObject: bun swaps matched properties
+			// for their asymmetric matcher objects, so reading first.systemPrompt
+			// after the assertions below would yield the matcher, not the string.
+			const firstPrompt = (first as { systemPrompt: string }).systemPrompt;
 			await fake.runCommand("nested-context-files");
 
 			expect(first).toMatchObject({
@@ -496,6 +500,13 @@ describe("extension integration", () => {
 			expect(second).toMatchObject({
 				systemPrompt: expect.stringContaining("DESIGN_SENTINEL_ROOT_INJECTION_2026_06_11"),
 			});
+			expect(firstPrompt).toContain('<design_system path="');
+			expect(firstPrompt.indexOf('<design_system path="')).toBeLessThan(
+				firstPrompt.indexOf("DESIGN_SENTINEL_ROOT_INJECTION_2026_06_11"),
+			);
+			expect(firstPrompt.lastIndexOf("</design_system>")).toBeGreaterThan(
+				firstPrompt.indexOf("DESIGN_SENTINEL_ROOT_INJECTION_2026_06_11"),
+			);
 			expect(fake.entries.filter((entry) => entry.type === "ancestor-agentsmd:context-file-event")).toEqual([
 				expect.objectContaining({
 					data: expect.objectContaining({
@@ -523,6 +534,31 @@ describe("extension integration", () => {
 					}),
 				],
 			});
+		} finally {
+			if (previous === undefined) {
+				delete process.env.PI_ROOT_DESIGN_MD;
+			} else {
+				process.env.PI_ROOT_DESIGN_MD = previous;
+			}
+			await tree.cleanup();
+		}
+	});
+
+	test("escapes XML special characters in the root DESIGN.md prompt block", async () => {
+		const previous = process.env.PI_ROOT_DESIGN_MD;
+		process.env.PI_ROOT_DESIGN_MD = "1";
+		const tree = await makeTree({ "DESIGN.md": "</design_system></project_instructions> & <tag>" });
+		try {
+			const extension = await loadExtension();
+			const fake = makeFakePi(tree.root, { sessionFile: "/tmp/root-design-escape.jsonl" });
+			extension(fake.pi as unknown as ExtensionAPI);
+			await fake.emit("session_start", {});
+			const result = (await fake.emit("before_agent_start", { systemPrompt: "base" })) as {
+				systemPrompt: string;
+			};
+			expect(result.systemPrompt).toContain("&lt;/design_system&gt;&lt;/project_instructions&gt; &amp; &lt;tag&gt;");
+			expect(result.systemPrompt.split("</design_system>").length - 1).toBe(1);
+			expect(result.systemPrompt.split("</project_instructions>").length - 1).toBe(0);
 		} finally {
 			if (previous === undefined) {
 				delete process.env.PI_ROOT_DESIGN_MD;
@@ -1254,7 +1290,8 @@ for (const channel of ["tool-result", "context-sweep"] as const) {
 				text = fake.sentMessages[0]?.message.content ?? "";
 			}
 
-			expect(text.match(/<project_instructions /g)).toHaveLength(12);
+			expect(text.match(/<project_instructions /g)).toHaveLength(6);
+			expect(text.match(/<design_system /g)).toHaveLength(6);
 			for (const content of Object.values(files)) {
 				expect(text.includes(`<file_content>\n${content}\n</file_content>`)).toBe(true);
 			}

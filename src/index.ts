@@ -232,7 +232,9 @@ async function collectRootDesignPrompt(
 
 	rememberRootDesignInjection(state, designPath);
 	appendRootDesignInjectionEvent(pi, sessionKey, state, designPath);
-	return basePrompt + `\n\n## ${designPath}\n\n${content}\n\n`;
+	// Same paired block as tool-result delivery, so the system-prompt append is
+	// delimited and XML-escaped like every other injected file.
+	return basePrompt + `\n\n${formatInstructions({ filepath: designPath, content })}\n\n`;
 }
 
 function appendManifestPrompt(basePrompt: string, manifestDirs: string[]) {

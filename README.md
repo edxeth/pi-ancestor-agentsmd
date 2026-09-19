@@ -42,13 +42,14 @@ A few rules keep that behavior sane:
 
 - closer directories come first, matching OpenCode's nearby-instruction order
 - the session root `AGENTS.md` is not re-added, because pi already loaded it at startup
+- nested injection matches the exact filename `AGENTS.md`; `AGENTS.override.md`, `AGENTS.MD`, `CLAUDE.md`, and `CLAUDE.MD` participate only in pi's startup context-file chain, never in nested injection
 - each injected file is only added once per session, then becomes eligible again after compaction/restart
 - symlink escapes outside the session root are rejected
 - context files are always injected in full, without per-file or collection byte limits
 - `--no-context-files` disables the entire extension
 
 
-Injected files use a paired `<project_instructions path="…" scope="…">` block. The scope identifies the directory subtree, while the contents can restrict individual rules to specific files or conditions. Every block contains the full file and states that its contents are already loaded. The same format is used for tool results and fallback context, without a `content_status` attribute or a partial-content branch.
+Injected `AGENTS.md` files use a paired `<project_instructions path="…" scope="…">` block. The scope identifies the directory subtree, while the contents can restrict individual rules to specific files or conditions. Every block contains the full file and states that its contents are already loaded. `DESIGN.md` files use the same shape with a `<design_system>` tag and a one-line note naming the Google Stitch design-system format. Tool results, fallback context, and the root `DESIGN.md` system-prompt block share these envelopes, without a `content_status` attribute or a partial-content branch.
 
 The extension does not shorten context files to fit the model context window. Large instruction sets consume their full token cost.
 
@@ -60,8 +61,8 @@ At session start the extension walks the project (bounded depth, common dependen
 
 ### DESIGN.md (opt-in via env vars)
 
-Root injection — appends `cwd/DESIGN.md` content to the system prompt before every agent start when enabled.
-Ancestor injection — walks ancestor directories for `DESIGN.md` files (same hierarchy rules and generic tool trigger as AGENTS.md).
+Root injection — appends `cwd/DESIGN.md` wrapped in a paired `<design_system>` block to the system prompt before every agent start when enabled.
+Ancestor injection — walks ancestor directories for `DESIGN.md` files (same hierarchy rules and generic tool trigger as AGENTS.md, each wrapped in the same `<design_system>` block).
 
 Both are disabled by default. Enable via:
 
