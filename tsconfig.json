@@ -16,5 +16,5 @@
 		"types": ["node", "bun-types"]
 	},
 	"include": ["src/**/*.ts", "tests/**/*.ts"],
-	"exclude": ["node_modules"]
+	"exclude": ["node_modules", "tests/e2e"]
 }

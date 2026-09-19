@@ -18,18 +18,20 @@ type ReadEvent = {
 };
 type FakeContext = {
 	cwd: string;
-	sessionManager?: { getSessionFile: () => string };
+	sessionManager?: { getSessionFile: () => string; buildContextEntries?: () => Array<{ message?: unknown }> };
 	ui: { notify: (message: string, type?: "info" | "warning" | "error") => void };
 };
 type Handler = (event: unknown, ctx: FakeContext) => unknown | Promise<unknown>;
 type CommandHandler = (args: string, ctx: FakeContext) => void | Promise<void>;
 type FakeEntry = { type: string; data: unknown };
+type SentMessage = { customType: string; content: string; display: boolean; details?: unknown };
 type FakePi = {
 	on: (event: string, handler: Handler) => void;
 	registerFlag: (name: string, options?: { default?: boolean }) => void;
 	getFlag: (name: string) => boolean;
 	registerCommand: (name: string, opts: { handler: CommandHandler }) => void;
 	appendEntry: (type: string, data?: unknown) => void;
+	sendMessage: (message: SentMessage, options?: { triggerTurn?: boolean; deliverAs?: string }) => Promise<void>;
 };
 
 async function makeTree(files: Record<string, string>) {
@@ -48,7 +50,12 @@ async function makeTree(files: Record<string, string>) {
 
 function makeFakePi(
 	cwd: string,
-	options: { sessionFile?: string; disabled?: boolean; withoutSessionManager?: boolean } = {},
+	options: {
+		sessionFile?: string;
+		disabled?: boolean;
+		withoutSessionManager?: boolean;
+		restoredMessages?: unknown[];
+	} = {},
 ) {
 	const handlers = new Map<string, Handler[]>();
 	const commands = new Map<string, CommandHandler>();
@@ -56,11 +63,15 @@ function makeFakePi(
 	const registeredFlags: string[] = [];
 	const registeredFlagOptions = new Map<string, { default?: boolean }>();
 	const notifications: string[] = [];
+	const sentMessages: Array<{ message: SentMessage; options?: { triggerTurn?: boolean; deliverAs?: string } }> = [];
 	const ctx: FakeContext = {
 		cwd,
 		sessionManager: options.withoutSessionManager
 			? undefined
-			: { getSessionFile: () => options.sessionFile ?? "/tmp/session.jsonl" },
+			: {
+					getSessionFile: () => options.sessionFile ?? "/tmp/session.jsonl",
+					buildContextEntries: () => (options.restoredMessages ?? []).map((message) => ({ message })),
+				},
 		ui: { notify: (message: string) => notifications.push(message) },
 	};
 	const pi: FakePi = {
@@ -78,11 +89,16 @@ function makeFakePi(
 		appendEntry: (type, data) => {
 			entries.push({ type, data });
 		},
+		sendMessage: (message, options) => {
+			sentMessages.push({ message, options });
+			return Promise.resolve();
+		},
 	};
 	return {
 		pi,
 		ctx,
 		entries,
+		sentMessages,
 		registeredFlags,
 		registeredFlagOptions,
 		notifications,
@@ -613,7 +629,244 @@ describe("extension integration", () => {
 		}
 	});
 
-	test("sweeps transcript tool calls on context and injects pending AGENTS.md durably", async () => {
+	test("delivers pending ancestor files once via sendMessage on session resume", async () => {
+		const tree = await makeTree({
+			"tests/AGENTS.md": "tests rules",
+			"tests/helper.ts": "helper content",
+		});
+		try {
+			const extension = await loadExtension();
+			const restored = [
+				{ role: "user", content: [{ type: "text", text: "inspect the tests" }], timestamp: 1 },
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "toolCall",
+							id: "call-1",
+							name: "shell_runner",
+							arguments: { cmd: "cat tests/helper.ts", workdir: tree.root },
+						},
+					],
+					timestamp: 2,
+				},
+			];
+			const fake = makeFakePi(tree.root, { restoredMessages: restored });
+			extension(fake.pi as unknown as ExtensionAPI);
+			await fake.emit("session_start", {
+				type: "session_start",
+				reason: "resume",
+				previousSessionFile: "/tmp/previous-session.jsonl",
+			});
+
+			expect(fake.sentMessages).toHaveLength(1);
+			const sent = fake.sentMessages[0]!;
+			expect(sent.message.customType).toBe("ancestor-agentsmd");
+			expect(sent.message.display).toBe(false);
+			expect(sent.message.content).toContain("<project_instructions");
+			expect(sent.message.content).toContain("tests rules");
+			expect(sent.options?.triggerTurn).toBe(false);
+
+			// The per-request context hook must not rebuild or move the message.
+			expect(await fake.emit("context", { messages: [...restored] })).toBeUndefined();
+			expect(fake.sentMessages).toHaveLength(1);
+		} finally {
+			await tree.cleanup();
+		}
+	});
+
+	test("does not re-deliver on resume when the restored transcript already carries the instructions", async () => {
+		const tree = await makeTree({
+			"tests/AGENTS.md": "tests rules",
+			"tests/helper.ts": "helper content",
+		});
+		try {
+			const extension = await loadExtension();
+			const toolCall = {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: tree.path("tests/helper.ts") } }],
+				timestamp: 1,
+			};
+			const deliveredHeader = `<project_instructions path="${tree.path("tests/AGENTS.md")}" scope="${tree.root}/tests/">`;
+			const restored = [
+				{ role: "user", content: [{ type: "text", text: "inspect" }], timestamp: 0 },
+				toolCall,
+				{
+					role: "toolResult",
+					toolCallId: "call-1",
+					toolName: "read",
+					content: [{ type: "text", text: `${deliveredHeader}\nfile content` }],
+					timestamp: 2,
+				},
+			];
+			const fake = makeFakePi(tree.root, { restoredMessages: restored });
+			extension(fake.pi as unknown as ExtensionAPI);
+			await fake.emit("session_start", { type: "session_start", reason: "resume" });
+			expect(fake.sentMessages).toHaveLength(0);
+
+			// A persisted fallback batch counts as delivered the same way.
+			const withBatch = makeFakePi(tree.root, {
+				restoredMessages: [
+					toolCall,
+					{
+						role: "custom",
+						customType: "ancestor-agentsmd",
+						content: `${deliveredHeader}\ntests rules`,
+						display: false,
+						timestamp: 3,
+					},
+				],
+			});
+			extension(withBatch.pi as unknown as ExtensionAPI);
+			await withBatch.emit("session_start", { type: "session_start", reason: "resume" });
+			expect(withBatch.sentMessages).toHaveLength(0);
+		} finally {
+			await tree.cleanup();
+		}
+	});
+
+	test("falls back to parsing the current session file and ignores the previous session on switch", async () => {
+		const tree = await makeTree({
+			"tests/AGENTS.md": "tests rules",
+			"tests/helper.ts": "helper content",
+		});
+		// The current session carries an undelivered tool call.
+		const currentSession = tree.path("session.jsonl");
+		await writeFile(
+			currentSession,
+			[
+				JSON.stringify({
+					message: {
+						role: "assistant",
+						content: [{ type: "toolCall", id: "call-switch", name: "read", arguments: { path: tree.path("tests/helper.ts") } }],
+					},
+				}),
+				JSON.stringify({ not_a_message_entry: true }),
+				"{ malformed json",
+				"",
+			].join("\n"),
+			"utf8",
+		);
+		// The session being LEFT already contains the instruction header; it
+		// must not suppress delivery for the session being switched to.
+		const previousSession = tree.path("previous-session.jsonl");
+		const header = `<project_instructions path="${tree.path("tests/AGENTS.md")}"`;
+		await writeFile(
+			previousSession,
+			JSON.stringify({ message: { role: "toolResult", content: [{ type: "text", text: `${header}\nalready delivered` }] } }) + "\n",
+			"utf8",
+		);
+		try {
+			const extension = await loadExtension();
+			const fake = makeFakePi(tree.root, { sessionFile: currentSession });
+			// Simulate a session manager without context restoration.
+			(fake.ctx.sessionManager as { buildContextEntries?: unknown }).buildContextEntries = undefined;
+			extension(fake.pi as unknown as ExtensionAPI);
+			await fake.emit("session_start", {
+				type: "session_start",
+				reason: "resume",
+				previousSessionFile: previousSession,
+			});
+			expect(fake.sentMessages).toHaveLength(1);
+			expect(fake.sentMessages[0]!.message.content).toContain("tests rules");
+			expect(fake.sentMessages[0]!.message.content).toContain("<project_instructions");
+		} finally {
+			await tree.cleanup();
+		}
+	});
+
+	test("keeps files pending when sendMessage is unavailable", async () => {
+		const tree = await makeTree({
+			"tests/AGENTS.md": "tests rules",
+			"tests/helper.ts": "helper content",
+		});
+		try {
+			const extension = await loadExtension();
+			const restored = [
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "call-nosend", name: "read", arguments: { path: tree.path("tests/helper.ts") } }],
+				},
+			];
+			const fake = makeFakePi(tree.root, { restoredMessages: restored });
+		delete (fake.pi as { sendMessage?: unknown }).sendMessage;
+			extension(fake.pi as unknown as ExtensionAPI);
+			await fake.emit("session_start", { type: "session_start", reason: "resume" });
+			expect(fake.sentMessages).toHaveLength(0);
+
+			// Once a usable sendMessage exists, the still-pending batch delivers.
+			const pi = fake.pi as unknown as Record<string, unknown>;
+			pi.sendMessage = ((message: { customType: string; content: string; display: boolean }, options: unknown) => {
+				fake.sentMessages.push({ message, options: options as { triggerTurn?: boolean } });
+				return Promise.resolve();
+			}) as unknown;
+			const transcript = [...restored, { role: "user", content: [{ type: "text", text: "continue" }], timestamp: 1 }];
+			await fake.emit("context", { messages: transcript });
+			expect(fake.sentMessages).toHaveLength(1);
+			expect(fake.sentMessages[0]!.message.content).toContain("tests rules");
+		} finally {
+			await tree.cleanup();
+		}
+	});
+
+	test("scans the restored transcript when a continued session starts with reason startup", async () => {
+		const tree = await makeTree({
+			"tests/AGENTS.md": "tests rules",
+			"tests/helper.ts": "helper content",
+		});
+		try {
+			const extension = await loadExtension();
+			const fake = makeFakePi(tree.root, {
+				restoredMessages: [
+					{
+						role: "assistant",
+						content: [{ type: "toolCall", id: "call-startup", name: "read", arguments: { path: tree.path("tests/helper.ts") } }],
+					},
+				],
+			});
+			extension(fake.pi as unknown as ExtensionAPI);
+			await fake.emit("session_start", { type: "session_start", reason: "startup" });
+			expect(fake.sentMessages).toHaveLength(1);
+			expect(fake.sentMessages[0]!.message.content).toContain("tests rules");
+		} finally {
+			await tree.cleanup();
+		}
+	});
+
+
+	test("context hook stays read-only and delivers mid-run discoveries once", async () => {
+		const tree = await makeTree({
+			"tests/AGENTS.md": "tests rules",
+			"tests/helper.ts": "helper content",
+		});
+		try {
+			const extension = await loadExtension();
+			const fake = makeFakePi(tree.root);
+			extension(fake.pi as unknown as ExtensionAPI);
+			await fake.emit("session_start", {});
+
+			const transcript = [
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "call-9", name: "shell_runner", arguments: { cmd: "cat tests/helper.ts" } }],
+					timestamp: 1,
+				},
+			];
+			expect(await fake.emit("context", { messages: transcript })).toBeUndefined();
+			expect(fake.sentMessages).toHaveLength(1);
+			const sent = fake.sentMessages[0]!;
+			expect(sent.message.content).toContain("tests rules");
+			expect(sent.options).toEqual({ triggerTurn: false, deliverAs: "steer" });
+
+			// Repeated requests must neither mutate the transcript nor re-deliver.
+			expect(await fake.emit("context", { messages: [...transcript] })).toBeUndefined();
+			expect(fake.sentMessages).toHaveLength(1);
+		} finally {
+			await tree.cleanup();
+		}
+	});
+
+	test("sweeps transcript tool calls on context and delivers pending AGENTS.md once", async () => {
 		const tree = await makeTree({
 			"tests/AGENTS.md": "tests rules",
 			"tests/helper.ts": "helper content",
@@ -642,25 +895,19 @@ describe("extension integration", () => {
 				},
 			];
 
-			const first = (await fake.emit("context", { messages: transcript })) as { messages: unknown[] };
-			expect(first.messages).toHaveLength(transcript.length + 1);
-			const swept = first.messages[first.messages.length - 1] as { role: string; content: string; display: boolean };
-			expect(swept.role).toBe("custom");
+			expect(await fake.emit("context", { messages: transcript })).toBeUndefined();
+			expect(fake.sentMessages).toHaveLength(1);
+			const swept = fake.sentMessages[0]!.message;
+			expect(swept.customType).toBe("ancestor-agentsmd");
 			expect(swept.display).toBe(false);
 			expect(swept.content).toContain("<project_instructions");
 			expect(swept.content).toContain("tests rules");
 
-			// The transform is per-request; a fed-back sweep message is replaced by
-			// a fresh one rather than appended after.
-			const second = (await fake.emit("context", { messages: [...transcript, swept] })) as {
-				messages: Array<{ role: string; content: string }>;
-			};
-			expect(second.messages).toHaveLength(transcript.length + 1);
-			expect(second.messages).not.toContain(swept);
-			const sweptAgain = second.messages[second.messages.length - 1]!;
-			expect(sweptAgain.role).toBe("custom");
-			expect(sweptAgain.content).toContain("tests rules");
-			expect(sweptAgain.content.indexOf("tests rules")).toBe(sweptAgain.content.lastIndexOf("tests rules"));
+			// A persisted batch fed back through the transcript must not trigger
+			// another delivery.
+			const persisted = { role: "custom", customType: "ancestor-agentsmd", content: swept.content, display: false };
+			expect(await fake.emit("context", { messages: [...transcript, persisted] })).toBeUndefined();
+			expect(fake.sentMessages).toHaveLength(1);
 
 			// Dedupe across channels: the file was delivered by the sweep, so the
 			// tool_result path must not inject it again.
@@ -674,11 +921,11 @@ describe("extension integration", () => {
 			expect(viaTool).toBeUndefined();
 
 			await fake.emit("session_compact", {});
-			const afterCompact = (await fake.emit("context", { messages: transcript })) as { messages: unknown[] };
-			expect(afterCompact.messages).toHaveLength(transcript.length + 1);
-			expect((afterCompact.messages[afterCompact.messages.length - 1] as { content: string }).content).toContain(
-				"tests rules",
-			);
+			// Compaction clears delivery memory, so the still-pending file is
+			// delivered again exactly once.
+			expect(await fake.emit("context", { messages: transcript })).toBeUndefined();
+			expect(fake.sentMessages).toHaveLength(2);
+			expect(fake.sentMessages[1]!.message.content).toContain("tests rules");
 
 		} finally {
 			await tree.cleanup();
@@ -791,7 +1038,7 @@ describe("extension integration", () => {
 			extension(fake.pi as unknown as ExtensionAPI);
 			await fake.emit("session_start", {});
 
-			const result = (await fake.emit("context", {
+			expect(await fake.emit("context", {
 				messages: [
 					{
 						role: "assistant",
@@ -801,11 +1048,10 @@ describe("extension integration", () => {
 						],
 					},
 				],
-			})) as { messages: Array<{ content: string }> };
-			expect(result.messages).toHaveLength(2);
-			expect(result.messages[1]?.content.indexOf("tests rules")).toBe(
-				result.messages[1]?.content.lastIndexOf("tests rules"),
-			);
+			})).toBeUndefined();
+			expect(fake.sentMessages).toHaveLength(1);
+			const content = fake.sentMessages[0]!.message.content;
+			expect(content.indexOf("tests rules")).toBe(content.lastIndexOf("tests rules"));
 		} finally {
 			await tree.cleanup();
 		}
@@ -819,16 +1065,16 @@ describe("extension integration", () => {
 			extension(fake.pi as unknown as ExtensionAPI);
 			await fake.emit("session_start", {});
 
-			const result = (await fake.emit("context", {
+			expect(await fake.emit("context", {
 				messages: [
 					{
 						role: "assistant",
 						content: [{ type: "toolCall", arguments: { path: "tests/helper.ts" } }],
 					},
 				],
-			})) as { messages: Array<{ content: string }> };
-			expect(result.messages).toHaveLength(2);
-			expect(result.messages[1]?.content).toContain("tests rules");
+			})).toBeUndefined();
+			expect(fake.sentMessages).toHaveLength(1);
+			expect(fake.sentMessages[0]!.message.content).toContain("tests rules");
 		} finally {
 			await tree.cleanup();
 		}
@@ -1002,11 +1248,10 @@ for (const channel of ["tool-result", "context-sweep"] as const) {
 			if (channel === "tool-result") {
 				text = contentText(await fake.emit("tool_result", readEvent(tree.path(target))));
 			} else {
-				// SAFETY: This narrows the actual context handler's returned messages at the fake API boundary.
-				const result = await fake.emit("context", {
+				await fake.emit("context", {
 					messages: [{ role: "assistant", content: [{ type: "toolCall", id: "full-files", arguments: { path: target } }] }],
-				}) as { messages: Array<{ content: string }> };
-				text = result.messages.at(-1)?.content ?? "";
+				});
+				text = fake.sentMessages[0]?.message.content ?? "";
 			}
 
 			expect(text.match(/<project_instructions /g)).toHaveLength(12);
@@ -1262,12 +1507,12 @@ test("recovers delivery when a downstream handler replaces the injected tool res
 				timestamp: 2,
 			},
 		];
-		const recovered = (await fake.emit("context", { messages: strippedTranscript })) as {
-			messages: Array<{ role: string; content: unknown }>;
-		};
-		const recoveredText = JSON.stringify(recovered.messages);
-		expect(recoveredText).toContain("PKG_RULES");
-		expect(recovered.messages.at(-1)?.role).toBe("custom");
+		expect(await fake.emit("context", { messages: strippedTranscript })).toBeUndefined();
+		expect(fake.sentMessages).toHaveLength(1);
+		expect(fake.sentMessages[0]!.message.content).toContain("PKG_RULES");
+		// Recovery is one-shot: the persisted message is never re-sent.
+		expect(await fake.emit("context", { messages: strippedTranscript })).toBeUndefined();
+		expect(fake.sentMessages).toHaveLength(1);
 	} finally {
 		await tree.cleanup();
 	}
@@ -1313,13 +1558,14 @@ test("does not retain stale sweep files after compaction without new tool calls"
 		extension(fake.pi as unknown as ExtensionAPI);
 		await fake.emit("session_start", {});
 
-		const swept = await fake.emit("context", {
+		await fake.emit("context", {
 			messages: [{ role: "assistant", content: [{ type: "toolCall", arguments: { path: "tests/helper.ts" } }] }],
 		});
-		expect(swept).toBeDefined();
+		expect(fake.sentMessages).toHaveLength(1);
 		await fake.emit("session_compact", {});
 
 		expect(await fake.emit("context", { messages: [] })).toBeUndefined();
+		expect(fake.sentMessages).toHaveLength(1);
 	} finally {
 		await tree.cleanup();
 	}
@@ -1333,13 +1579,14 @@ test("does not retain stale sweep files after shutdown without new tool calls", 
 		extension(fake.pi as unknown as ExtensionAPI);
 		await fake.emit("session_start", {});
 
-		const swept = await fake.emit("context", {
+		await fake.emit("context", {
 			messages: [{ role: "assistant", content: [{ type: "toolCall", arguments: { path: "tests/helper.ts" } }] }],
 		});
-		expect(swept).toBeDefined();
+		expect(fake.sentMessages).toHaveLength(1);
 		await fake.emit("session_shutdown", {});
 
 		expect(await fake.emit("context", { messages: [] })).toBeUndefined();
+		expect(fake.sentMessages).toHaveLength(1);
 	} finally {
 		await tree.cleanup();
 	}
@@ -1363,40 +1610,58 @@ test("recovers delivery when transcript messages or blocks are malformed", async
 		});
 		expect(contentText(injected)).toContain("PKG_RULES");
 
-		const recovered = (await fake.emit("context", {
+		expect(await fake.emit("context", {
 			messages: [
 				null,
 				{ role: "assistant", content: [null] },
 				{ role: "toolResult", content: "not an array" },
 			],
-		})) as { messages: Array<{ role: string; content: string }> };
-		expect(recovered.messages.at(-1)?.role).toBe("custom");
-		expect(recovered.messages.at(-1)?.content).toContain("PKG_RULES");
+		})).toBeUndefined();
+		expect(fake.sentMessages).toHaveLength(1);
+		expect(fake.sentMessages[0]!.message.content).toContain("PKG_RULES");
 	} finally {
 		await tree.cleanup();
 	}
 });
 
-test("preserves non-sweep custom messages while rebuilding the sweep message", async () => {
-	const tree = await makeTree({ "tests/AGENTS.md": "tests rules", "tests/helper.ts": "helper" });
+test("delivers only newly pending files when the transcript already carries a persisted batch", async () => {
+	const tree = await makeTree({
+		"pkg-a/AGENTS.md": "PKG_A_RULES",
+		"pkg-a/file.ts": "a",
+		"pkg-b/AGENTS.md": "PKG_B_RULES",
+		"pkg-b/file.ts": "b",
+	});
 	try {
 		const extension = await loadExtension();
 		const fake = makeFakePi(tree.root);
 		extension(fake.pi as unknown as ExtensionAPI);
 		await fake.emit("session_start", {});
 
-		const preserved = { role: "user", customType: "ancestor-agentsmd", content: "keep this" };
-		const result = (await fake.emit("context", {
+		const deliveredHeader = `<project_instructions path="${tree.path("pkg-a/AGENTS.md")}" scope="${tree.path("pkg-a")}/">`;
+		const persistedBatch = {
+			role: "custom",
+			customType: "ancestor-agentsmd",
+			content: `${deliveredHeader}\nPKG_A_RULES`,
+			display: false,
+		};
+		expect(
+			await fake.emit("context", {
 			messages: [
 				{
 					role: "assistant",
-					content: [{ type: "toolCall", id: "call-filter", arguments: { path: "tests/helper.ts" } }],
+					content: [
+						{ type: "toolCall", id: "call-a", arguments: { path: tree.path("pkg-a/file.ts") } },
+						{ type: "toolCall", id: "call-b", arguments: { path: tree.path("pkg-b/file.ts") } },
+					],
 				},
-				preserved,
+				persistedBatch,
 			],
-		})) as { messages: unknown[] };
-		expect(result.messages).toContain(preserved);
-		expect(result.messages).toHaveLength(3);
+			}),
+		).toBeUndefined();
+		expect(fake.sentMessages).toHaveLength(1);
+		const content = fake.sentMessages[0]!.message.content;
+		expect(content).toContain("PKG_B_RULES");
+		expect(content).not.toContain("PKG_A_RULES");
 	} finally {
 		await tree.cleanup();
 	}
@@ -1449,11 +1714,10 @@ test("uses the same complete scoped envelope for tool results and fallback conte
 		await normal.emit("session_start", {});
 		await fallback.emit("session_start", {});
 		const injected = await normal.emit("tool_result", readEvent(tree.path("pkg/file.ts")));
-		// SAFETY: The actual context handler returns messages; this narrows the fake API's unknown event boundary.
-		const swept = await fallback.emit("context", {
+		await fallback.emit("context", {
 			messages: [{ role: "assistant", content: [{ type: "toolCall", id: "envelope-read", arguments: { path: "pkg/file.ts" } }] }],
-		}) as { messages: Array<{ role: string; content: string }> };
-		const envelope = swept.messages.at(-1)?.content;
+		});
+		const envelope = fallback.sentMessages[0]?.message.content;
 		expect(envelope).toContain("complete file contents are already loaded");
 		expect(envelope).toContain('scope="' + tree.path("pkg") + path.sep + '"');
 		expect(contentText(injected)).toBe(envelope + "\nfile content");

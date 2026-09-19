@@ -54,10 +54,6 @@ The extension does not shorten context files to fit the model context window. La
 
 The startup manifest accepts complete injected contents as loaded instructions. A separate read is not required just to load them again. Injection still occurs after tool execution, so this format does not enforce instruction delivery before a first write.
 
-#### Transcript sweep (defense in depth)
-
-On every LLM request the extension also sweeps the recent transcript (last 40 messages) for tool calls whose paths never reached the model — restored sessions, foreign tool surfaces, or dropped injections — and appends any still-pending ancestor files as a context message. Because the request-time transform is ephemeral, accumulated files are re-appended on each request so they stay visible for the rest of the session.
-
 #### Startup manifest (backstop)
 
 At session start the extension walks the project (bounded depth, common dependency directories skipped) and appends an index of every directory containing a nested `AGENTS.md` to the system prompt, with an instruction to read the applicable file before working under those paths. This is tool-independent by construction: even an agent whose tools never expose a path discovers where the nested rules live. Disable with `PI_NESTED_AGENTS_MANIFEST=0`.

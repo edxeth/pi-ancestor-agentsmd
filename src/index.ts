@@ -1,6 +1,5 @@
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { extractPathCandidates } from "./extract.js";
 import { formatInstructions, instructionHeader } from "./instructions.js";
@@ -340,86 +339,151 @@ function appendPendingSweepFiles(state: SessionState, files: AgentsFile[], type:
 	rememberInjectedFiles(state, files, type, new Set(), "context-sweep");
 }
 
-async function sweepToolCall(state: SessionState, call: ToolCallInput, root: string) {
-	if (!isNewSweepCall(call, state)) return;
-	const targets = await resolveContainedTargets(call.input, root);
-	for (const target of targets) {
-		const { designFiles, agentsFiles } = await collectFilesForTarget(target);
-		const pendingDesign = takePending(designFiles, state.loadedDesignPaths);
-		const pendingAgents = takePending(agentsFiles, state.loadedAgentsPaths);
-		appendPendingSweepFiles(state, pendingAgents, "AGENTS.md");
-		appendPendingSweepFiles(state, pendingDesign, "DESIGN.md");
-	}
-}
-
-async function sweepToolCalls(messages: readonly unknown[], state: SessionState, root: string) {
-	for (const call of collectToolCallInputs(messages)) await sweepToolCall(state, call, root);
-}
-
-function createSweepContext(messages: AgentMessage[], files: AgentsFile[]) {
-	const text = files.map(formatInstructions).join("\n\n");
-	const message: AgentMessage = {
-		role: "custom",
-		customType: SWEEP_CUSTOM_TYPE,
-		content: text,
-		display: false,
-		timestamp: Date.now(),
-	};
-	return { messages: [...messages, message] };
-}
-
-function blockContainsHeader(block: unknown, header: string) {
-	if (!isObjectInput(block)) return false;
-	const text = (block as { text?: unknown }).text;
-	return typeof text === "string" && text.includes(header);
-}
-
-function messageContainsHeader(message: unknown, header: string) {
-	if (!isObjectInput(message)) return false;
+/** Extract the readable text of one message for delivered-header detection. */
+function messageText(message: unknown): string {
+	if (typeof message !== "object" || message === null) return "";
 	const content = (message as MessageLike).content;
-	if (!Array.isArray(content)) return false;
-	for (const block of content) {
-		if (blockContainsHeader(block, header)) return true;
-	}
-	return false;
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((block) =>
+			typeof block === "object" && block !== null && typeof (block as { text?: unknown }).text === "string"
+				? (block as { text: string }).text
+				: "",
+		)
+		.join("\n");
 }
 
-function transcriptContainsHeader(messages: readonly unknown[], header: string) {
-	const start = Math.max(0, messages.length - SWEEP_SCAN_MESSAGES);
-	for (let i = start; i < messages.length; i++) {
-		if (messageContainsHeader(messages[i], header)) return true;
+/**
+ * Restored-transcript text: tool-result injections and persisted fallback
+ * batches both carry instruction headers, so one text scan covers every
+ * earlier delivery channel.
+ */
+function transcriptText(messages: readonly unknown[]) {
+	return messages.map(messageText).join("\n");
+}
+
+/** Deliver pending sweep files as one persistent, append-only session message. */
+async function flushSweptFiles(pi: ExtensionAPI, state: SessionState) {
+	if (state.sweptFiles.length === 0) return;
+	// Without a usable sendMessage the files must stay pending, because the
+	// callers below have already marked them loaded; dropping them here would
+	// silently lose delivery for the rest of the process.
+	if (typeof pi.sendMessage !== "function") return;
+	const files = state.sweptFiles.splice(0);
+	await pi.sendMessage(
+		{
+			customType: SWEEP_CUSTOM_TYPE,
+			content: files.map(formatInstructions).join("\n\n"),
+			display: false,
+		},
+		{ triggerTurn: false, deliverAs: "steer" },
+	);
+}
+
+type RestoredEntry = { message?: unknown; type?: unknown; customType?: unknown; content?: unknown };
+
+/**
+ * Map one session entry to its in-context message. Message entries wrap a
+ * message; custom message entries carry their fields directly on the entry.
+ */
+function restoredEntryMessage(entry: unknown): unknown {
+	if (typeof entry !== "object" || entry === null) return undefined;
+	const typed = entry as RestoredEntry;
+	if (typed.message !== undefined) return typed.message;
+	if (typed.type === "custom_message" && typed.customType !== undefined && typed.content !== undefined) {
+		return { role: "custom", customType: typed.customType, content: typed.content };
 	}
-	return false;
+	return undefined;
+}
+
+
+async function readRestoredMessages(
+	ctx: {
+		sessionManager?: {
+			getSessionFile?: () => string | null | undefined;
+			buildContextEntries?: () => unknown[];
+		};
+	},
+): Promise<readonly unknown[]> {
+	// buildContextEntries is the compaction-aware view of the active session;
+	// getBranch is deliberately not used because it includes entries dropped by
+	// compaction, which could mark an instruction as delivered when the model
+	// can no longer see it.
+	const entries = ctx.sessionManager?.buildContextEntries?.();
+	if (Array.isArray(entries)) {
+		return entries.map(restoredEntryMessage).filter((message) => message !== undefined);
+	}
+	// Best-effort fallback for hosts without context entries: read the CURRENT
+	// session file. The session_start event's previousSessionFile names the
+	// session being left, which on an in-process switch is the wrong transcript.
+	const sessionFile = ctx.sessionManager?.getSessionFile?.();
+	if (typeof sessionFile !== "string" || sessionFile.length === 0) return [];
+	let raw: string;
+	try {
+		raw = await readFile(sessionFile, "utf8");
+	} catch {
+		return [];
+	}
+	const messages: unknown[] = [];
+	for (const line of raw.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		try {
+			const message = restoredEntryMessage(JSON.parse(trimmed));
+			if (message !== undefined) messages.push(message);
+		} catch {
+			// Skip malformed lines; delivery falls back to later tool activity.
+		}
+	}
+	return messages;
+}
+
+/**
+ * Collect still-pending ancestor files named by transcript tool calls. Files
+ * whose instruction header already appears in the transcript — through a
+ * tool-result injection or a persisted fallback batch — count as delivered, so
+ * repeated scans, fed-back batches, and restored sessions never re-deliver.
+ */
+async function collectTranscriptSweepFiles(messages: readonly unknown[], state: SessionState, root: string) {
+	const agentsCandidates: AgentsFile[] = [];
+	const designCandidates: AgentsFile[] = [];
+	for (const call of collectToolCallInputs(messages)) {
+		if (!isNewSweepCall(call, state)) continue;
+		for (const target of await resolveContainedTargets(call.input, root)) {
+			const { designFiles, agentsFiles } = await collectFilesForTarget(target);
+			agentsCandidates.push(...agentsFiles);
+			designCandidates.push(...designFiles);
+		}
+	}
+	const pendingAgents = takePending(agentsCandidates, state.loadedAgentsPaths);
+	const pendingDesign = takePending(designCandidates, state.loadedDesignPaths);
+	if (pendingAgents.length === 0 && pendingDesign.length === 0) return;
+	const text = transcriptText(messages);
+	appendPendingSweepFiles(state, pendingAgents.filter((file) => !text.includes(instructionHeader(file.filepath))), "AGENTS.md");
+	appendPendingSweepFiles(
+		state,
+		pendingDesign.filter((file) => !text.includes(instructionHeader(file.filepath))),
+		"DESIGN.md",
+	);
 }
 
 /**
  * Delivery confirmation: a tool-result injection counts as delivered only once
- * its header is observed in the final transcript. A downstream extension that
- * replaced the result removes the header; the file is then re-delivered through
- * the self-healing sweep message instead.
+	* its header is observed anywhere in the transcript text, the same single
+	* source of truth the sweep uses. A downstream extension that replaced the
+	* result removes the header; the file is then re-delivered through one
+	* persistent fallback batch instead.
  */
 function reconcileUnconfirmedFiles(state: SessionState, messages: readonly unknown[]) {
 	if (state.unconfirmedFiles.size === 0) return;
+	const text = transcriptText(messages);
 	for (const [filepath, file] of [...state.unconfirmedFiles]) {
 		state.unconfirmedFiles.delete(filepath);
-		if (!transcriptContainsHeader(messages, instructionHeader(filepath))) {
+		if (!text.includes(instructionHeader(filepath))) {
 			state.sweptFiles.push(file);
 		}
 	}
-}
-
-function isSweepMessage(message: unknown) {
-	return (
-		typeof message === "object" &&
-		message !== null &&
-		(message as { role?: unknown }).role === "custom" &&
-		(message as { customType?: unknown }).customType === SWEEP_CUSTOM_TYPE
-	);
-}
-
-/** The sweep message is rebuilt every request; a fed-back or persisted copy is replaced, never appended after. */
-function filterSweepMessages(messages: readonly AgentMessage[]) {
-	return messages.filter((message) => !isSweepMessage(message));
 }
 
 export default function (pi: ExtensionAPI) {
@@ -442,11 +506,25 @@ export default function (pi: ExtensionAPI) {
 	if (hasNoContextFilesFlag()) return;
 
 	pi.on("session_start", async (_event, ctx) => {
+		const event = _event as { reason?: unknown; previousSessionFile?: string | undefined };
 		clearSession(getSessionKey(ctx));
 		const state = getSessionState(getSessionKey(ctx));
 		state.root = ctx.cwd;
 		state.disabled = pi.getFlag?.(FLAG_NO_CONTEXT_FILES) === true;
 		state.manifestDirs = await computeManifestDirs(state.root);
+		if (state.disabled) return;
+
+		// Restored transcripts never passed through this process's
+		// tool_result handler, so deliver anything still pending once as a
+		// persistent message instead of a per-request context suffix. A new
+		// process continuing a session emits "startup", not "resume"; a fresh
+		// session yields no message entries, making the scan a no-op.
+		const reason = event.reason;
+		if (reason !== "startup" && reason !== "resume" && reason !== "fork" && reason !== "reload") return;
+		const messages = await readRestoredMessages(ctx);
+		if (messages.length === 0) return;
+		await collectTranscriptSweepFiles(messages, state, state.root);
+		await flushSweptFiles(pi, state);
 	});
 
 	// Pre-execution snapshot: collect applicable files while the named paths
@@ -503,20 +581,17 @@ export default function (pi: ExtensionAPI) {
 		return { content: withAgents.content };
 	});
 
-	// Transcript sweep: on every LLM request, extract paths from recent tool
-	// calls in the transcript and deliver any still-pending ancestor files as an
-	// appended context message. Covers tool activity the tool_result handler
-	// never saw (restored sessions, foreign tool surfaces, dropped injections).
-	// The transform is per-request and ephemeral, so accumulated files are
-	// re-appended on each request to stay visible for the rest of the session.
+	// Transcript sweep: discover tool activity the tool_result handler never
+	// saw (error results, foreign tool surfaces) and deliver pending ancestor
+	// files once as a persistent session message that lands before the next
+	// LLM call. The hook itself never mutates request messages, so request
+	// prefixes stay append-only and provider prompt caches remain valid.
 	pi.on("context", async (event, ctx) => {
 		const state = getSessionState(getSessionKey(ctx));
 		if (state.disabled) return;
-		await sweepToolCalls(event.messages, state, state.root);
+		await collectTranscriptSweepFiles(event.messages, state, state.root);
 		reconcileUnconfirmedFiles(state, event.messages);
-
-		if (state.sweptFiles.length === 0) return;
-		return createSweepContext(filterSweepMessages(event.messages), state.sweptFiles);
+		await flushSweptFiles(pi, state);
 	});
 
 	pi.on("session_compact", async (_event, ctx) => {
