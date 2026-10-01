@@ -9,125 +9,93 @@
 > We talk about what’s new, what’s useful, and what’s actually worth paying attention to in AI.  
 > *And if you want more than conversation,* members also get access to **heavily discounted AI products and services** — including deals on tools like **ChatGPT Plus** and more for just a few dollars.
 
-Pi already loads `AGENTS.md` at startup from the current working directory and its parent directories. That covers project-level guidance, but it misses a common case in larger repos: the agent starts at the root, then later reads files inside a more specific area like `frontend/` or `docs/`, where another `AGENTS.md` exists.
+Automatically load project instructions from `AGENTS.md` and design guidance from `DESIGN.md`.
 
-This package fills that gap.
+## AGENTS.md
 
-It is inspired by OpenCode's instruction-file resolution model: when a file is read, instruction files closer to that file should win over broader project-level ones. OpenCode applies that idea to instruction files such as `AGENTS.md` and `CLAUDE.md`. This package brings the same general behavior to pi for `AGENTS.md`.
+Pi loads `AGENTS.md` from the directory where you start it and its parent directories. Those files provide general project rules. This extension adds more specific rules from subfolders, such as `frontend/` or `docs/`, when the agent works there.
 
-Beyond AGENTS.md, the package also supports [DESIGN.md](https://designmd.ai/what-is-design-md) — the Google Stitch open-source design system format. Two opt-in environment variables enable injecting DESIGN.md into the agent's context, either at startup (root file) or dynamically via ancestor walking.
+The extension finds file paths in tool requests, including shell commands. It loads `AGENTS.md` files between the requested file and the starting directory, with the closest directory first. It does not add the starting directory's `AGENTS.md` again because Pi already loads it.
 
-## What it does
+For example, when the agent reads `frontend/src/components/Button.tsx`, it receives the following, in order:
 
-### AGENTS.md
+1. `frontend/src/components/AGENTS.md`, if present.
+2. `frontend/src/AGENTS.md`, if present.
+3. `frontend/AGENTS.md`, if present.
+4. The contents of `frontend/src/components/Button.tsx`.
 
-When a tool touches a file below the session root, this extension prepends ancestor `AGENTS.md` files to that tool's result before the file content.
+Each instruction file applies to its own directory and the subfolders below it. Rules in the file can narrow that scope further. More specific instructions take precedence over conflicting project-wide rules, following OpenCode's nearby-file approach.
 
-The trigger is generic path extraction over any tool's input — structured keys such as `path`, `file_path`, `workdir`, or `cwd`, plus path-looking tokens inside arbitrary strings like `cat frontend/src/components/Button.tsx`. No tool name is matched, so tool replacements that hide the built-in `read`/`bash` tools behind a single shell tool (codex-style adapters, MCP gateways, ...) keep nested rules flowing.
+Repeated tool calls do not keep adding the same instruction files. The extension can load them again after Pi shortens the conversation or restarts. It loads only the exact filename `AGENTS.md` from subfolders, not `AGENTS.override.md`, `AGENTS.MD`, `CLAUDE.md`, or `CLAUDE.MD`. Pi's startup rules for those names are unchanged.
 
-If a tool touches:
+This feature is on by default. Set `PI_ANCESTOR_AGENTS_MD=0` to disable it.
 
-```text
-frontend/src/components/Button.tsx
-```
+## DESIGN.md
 
-then the model sees injected context before the file content, ordered from closest nested file to broadest nested file:
+[DESIGN.md](https://designmd.ai/what-is-design-md) is the Google Stitch format for project design guidance. This extension supports a file in the starting directory and files in subfolders. The two options work independently, and both are off by default.
 
-1. `frontend/src/components/AGENTS.md` if present
-2. `frontend/src/AGENTS.md` if present
-3. `frontend/AGENTS.md` if present
-4. `frontend/src/components/Button.tsx`
+### Design guidance for the whole session
 
-A few rules keep that behavior sane:
+With `PI_ROOT_DESIGN_MD=1`, the agent receives `DESIGN.md` from the directory where you start Pi. The session saves one copy at startup and keeps it unchanged. Resuming the session or returning to an earlier point in the conversation keeps the same copy.
 
-- closer directories come first, matching OpenCode's nearby-instruction order
-- the session root `AGENTS.md` is not re-added, because pi already loaded it at startup
-- nested injection matches the exact filename `AGENTS.md`; `AGENTS.override.md`, `AGENTS.MD`, `CLAUDE.md`, and `CLAUDE.MD` participate only in pi's startup context-file chain, never in nested injection
-- each injected file is only added once per session, then becomes eligible again after compaction/restart
-- symlink escapes outside the session root are rejected
-- context files are always injected in full, without per-file or collection byte limits
-- `--no-context-files` disables the entire extension
+A fork, a separate session copied from this conversation, also keeps that copy. If Pi shortens a long conversation, the saved guidance stays available. Start a new session to use file edits or changes to `PI_ROOT_DESIGN_MD`.
 
+If this option is off at startup, enabling it later does not change the session. An absent, empty, or unreadable file leaves the session without this design guidance. An unreadable file also produces a warning.
 
-Injected `AGENTS.md` files use a paired `<project_instructions path="…" scope="…">` block. The scope identifies the directory subtree, while the contents can restrict individual rules to specific files or conditions. Every block contains the full file and states that its contents are already loaded. `DESIGN.md` files use the same shape with a `<design_system>` tag and a one-line note naming the Google Stitch design-system format. Tool results, fallback context, and the root `DESIGN.md` system-prompt block share these envelopes, without a `content_status` attribute or a partial-content branch.
+If a fork cannot recover its saved guidance, Pi warns and continues without it. It does not substitute the current file, which can contain different rules.
 
-The extension does not shorten context files to fit the model context window. Large instruction sets consume their full token cost.
+### Design guidance for subfolders
 
-Injection still occurs after tool execution, so this format does not enforce instruction delivery before a first write.
+With `PI_ANCESTOR_DESIGN_MD=1`, the extension loads `DESIGN.md` files as tools use files in subfolders. It follows the same directory order and repeat-loading rules as `AGENTS.md`. More specific design rules take precedence for interface work in that part of the project.
 
-### DESIGN.md (opt-in via env vars)
+This option skips the starting directory's `DESIGN.md`. Enable `PI_ROOT_DESIGN_MD` separately to use that file as well. Only the exact filename `DESIGN.md` is recognized.
 
-Root injection — appends `cwd/DESIGN.md` wrapped in a paired `<design_system>` block to the system prompt before every agent start when enabled.
-Ancestor injection — walks ancestor directories for `DESIGN.md` files (same hierarchy rules and generic tool trigger as AGENTS.md, each wrapped in the same `<design_system>` block).
+## What you see in Pi
 
-Both are disabled by default. Enable via:
-
-```bash
-# Inject root cwd/DESIGN.md into each agent-start system prompt
-PI_ROOT_DESIGN_MD=1
-
-# Walk ancestor dirs for DESIGN.md on tool activity
-PI_ANCESTOR_DESIGN_MD=1
-
-# Both work independently and can be combined
-PI_ROOT_DESIGN_MD=1 PI_ANCESTOR_DESIGN_MD=1
-```
-
-Root DESIGN.md is injected via the `before_agent_start` event — no user-visible `read` tool call is needed. The model sees it on the first turn and on later user prompts. Ancestor DESIGN.md follows the same walk-up rules as AGENTS.md (closest first, skip root, dedup'd per session).
-
-## What it looks like in pi
-
-This package does not create a separate visible `read AGENTS.md` or `read DESIGN.md` tool call.
-
-In the TUI you still see a normal row such as:
+The extension does not create a separate visible `read AGENTS.md` or `read DESIGN.md` tool call. You still see the tool call that the agent requested, such as:
 
 ```text
 read frontend/package.json
 ```
 
-The injected content appears inside that read result, above the file content. Root DESIGN.md content appears in the system prompt — no TUI-visible tool call at all. Each root injection is also recorded as an `ancestor-agentsmd:context-file-event` custom session entry.
+The nearby instructions appear above the requested file content in the tool result. Design guidance from the starting directory is available without a visible file read. For troubleshooting, run `/nested-context-files` to record the files that the extension tracks in the session log.
 
-## Why it is implemented this way
+These limits apply:
 
-This package does not override pi's `read` tool.
+- Instruction files load in full, even when the agent reads only part of the requested file. Large instruction files use more of the model's available input space.
+- Links cannot make the extension load files outside the starting directory.
+- Instructions from subfolders arrive after a tool runs. The agent can therefore change a file before it sees those instructions.
 
-Instead, it patches `read` results in `tool_result`. That keeps it compatible with extensions that also customize `read`, while preserving normal `read` semantics such as `offset` and `limit`.
+## Install and configuration
 
-For root DESIGN.md injection, it hooks `before_agent_start` and appends to the system prompt. This makes the design system available on every user prompt, at the cost of including the root `DESIGN.md` tokens in each agent-start request.
-
-## Environment variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PI_ROOT_DESIGN_MD` | `0` | Inject `cwd/DESIGN.md` into each agent-start system prompt |
-| `PI_ANCESTOR_DESIGN_MD` | `0` | Inject ancestor `DESIGN.md` files on file reads |
-| `PI_ANCESTOR_AGENTS_MD` | `1` | Inject ancestor `AGENTS.md` files on file reads (set to `0` to disable) |
-
-## CLI flags
-
-| Flag | Effect |
-|------|--------|
-| `--no-context-files`, `-nc` | Disables the entire extension (AGENTS.md + DESIGN.md both) |
-
-## Slash commands
-
-| Command | Effect |
-|---------|--------|
-| `/nested-context-files` | Writes a debug session entry listing injected `AGENTS.md` and `DESIGN.md` files, including root system-prompt injections |
-
-## Install
+This extension requires pi 0.99.2 or newer. Install it with:
 
 ```bash
 pi install git:github.com/edxeth/pi-ancestor-agentsmd
 ```
 
-## Testing
+Set these environment variables before starting Pi:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `PI_ANCESTOR_AGENTS_MD` | `1` | Load `AGENTS.md` files from subfolders. |
+| `PI_ROOT_DESIGN_MD` | `0` | Use `DESIGN.md` from the starting directory for the whole session. |
+| `PI_ANCESTOR_DESIGN_MD` | `0` | Load `DESIGN.md` files from subfolders. |
+
+Use `1` to enable a feature and `0` to disable it. To enable both `DESIGN.md` options, start Pi with:
 
 ```bash
-cd ~/.pi/agent/extensions/pi-ancestor-agentsmd
+PI_ROOT_DESIGN_MD=1 PI_ANCESTOR_DESIGN_MD=1 pi
+```
+
+To disable the entire extension, pass `--no-context-files` or `-nc` when you start Pi.
+
+---
+
+Run the tests from the project directory:
+
+```bash
 bun test tests/*.test.ts
 ```
 
-## License
-
-MIT
+License: MIT.

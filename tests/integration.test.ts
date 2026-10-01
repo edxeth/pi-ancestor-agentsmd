@@ -1,8 +1,10 @@
 import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { ROOT_DESIGN_SNAPSHOT_ENTRY, type RootDesignSnapshot } from "../src/root-design.js";
 
 async function loadExtension() {
 	return (await import("../src/index.js")).default;
@@ -18,7 +20,16 @@ type ReadEvent = {
 };
 type FakeContext = {
 	cwd: string;
-	sessionManager?: { getSessionFile: () => string; buildContextEntries?: () => Array<{ message?: unknown }> };
+	sessionManager?: {
+		getSessionFile: () => string;
+		buildContextEntries?: () => Array<{ message?: unknown }>;
+		getBranch?: () => Array<Record<string, unknown>>;
+		getEntries?: () => Array<Record<string, unknown>>;
+		getHeader?: () => { parentSession?: string } | undefined;
+		buildSessionProjection?: () => {
+			entries: Array<{ sourceEntry: Record<string, unknown>; messages: unknown[] }>;
+		};
+	};
 	ui: { notify: (message: string, type?: "info" | "warning" | "error") => void };
 };
 type Handler = (event: unknown, ctx: FakeContext) => unknown | Promise<unknown>;
@@ -71,6 +82,39 @@ function makeFakePi(
 			: {
 					getSessionFile: () => options.sessionFile ?? "/tmp/session.jsonl",
 					buildContextEntries: () => (options.restoredMessages ?? []).map((message) => ({ message })),
+					// The views the root-DESIGN record path reads: appended fake
+					// entries appear as custom source entries without messages.
+					getBranch: () => entries.map((entry, index) => ({
+						id: `fake-${index}`,
+						parentId: null,
+						timestamp: "2026-01-01T00:00:00.000Z",
+						type: "custom",
+						customType: entry.type,
+						data: entry.data,
+					})),
+					getEntries: () => entries.map((entry, index) => ({
+						id: `fake-${index}`,
+						parentId: null,
+						timestamp: "2026-01-01T00:00:00.000Z",
+						type: "custom",
+						customType: entry.type,
+						data: entry.data,
+					})),
+					// Fakes have no fork lineage: no parent session to inherit from.
+					getHeader: () => undefined,
+					buildSessionProjection: () => ({
+						entries: entries.map((entry, index) => ({
+							sourceEntry: {
+								id: `fake-${index}`,
+								parentId: null,
+								timestamp: "2026-01-01T00:00:00.000Z",
+								type: "custom",
+								customType: entry.type,
+								data: entry.data,
+							},
+							messages: [],
+						})),
+					}),
 				},
 		ui: { notify: (message: string) => notifications.push(message) },
 	};
@@ -336,7 +380,7 @@ describe("extension integration", () => {
 		}
 	});
 
-	test("does not inject when root DESIGN.md is enabled but absent", async () => {
+	test("records the empty state when enabled but the file is absent", async () => {
 		const previous = process.env.PI_ROOT_DESIGN_MD;
 		process.env.PI_ROOT_DESIGN_MD = "1";
 		const tree = await makeTree({ "src/file.ts": "x" });
@@ -347,6 +391,13 @@ describe("extension integration", () => {
 			await fake.emit("session_start", {});
 
 			expect(await fake.emit("before_agent_start", { systemPrompt: "base" })).toBeUndefined();
+			expect(await fake.emit("context", { messages: [] })).toBeUndefined();
+			const snapshots = fake.entries.filter((entry) => entry.type === ROOT_DESIGN_SNAPSHOT_ENTRY);
+			expect(snapshots.length).toBe(1);
+			// SAFETY: length asserted above; the extension serialized this fixture entry itself.
+			const data = snapshots[0]!.data as RootDesignSnapshot;
+			expect(data.block).toBe("");
+			expect(data.content).toBe("");
 		} finally {
 			if (previous === undefined) delete process.env.PI_ROOT_DESIGN_MD;
 			else process.env.PI_ROOT_DESIGN_MD = previous;
@@ -354,7 +405,7 @@ describe("extension integration", () => {
 		}
 	});
 
-	test("does not inject an empty root DESIGN.md", async () => {
+	test("records the empty state for an empty file", async () => {
 		const previous = process.env.PI_ROOT_DESIGN_MD;
 		process.env.PI_ROOT_DESIGN_MD = "1";
 		const tree = await makeTree({ "DESIGN.md": "" });
@@ -365,6 +416,10 @@ describe("extension integration", () => {
 			await fake.emit("session_start", {});
 
 			expect(await fake.emit("before_agent_start", { systemPrompt: "base" })).toBeUndefined();
+			const snapshots = fake.entries.filter((entry) => entry.type === ROOT_DESIGN_SNAPSHOT_ENTRY);
+			expect(snapshots.length).toBe(1);
+			// SAFETY: length asserted above; the extension serialized this fixture entry itself.
+			expect((snapshots[0]!.data as RootDesignSnapshot).block).toBe("");
 		} finally {
 			if (previous === undefined) delete process.env.PI_ROOT_DESIGN_MD;
 			else process.env.PI_ROOT_DESIGN_MD = previous;
@@ -476,10 +531,11 @@ describe("extension integration", () => {
 		}
 	});
 
-	test("injects root DESIGN.md into every agent start and records debug state", async () => {
+	test("records a root DESIGN.md snapshot once and records debug state", async () => {
 		const previous = process.env.PI_ROOT_DESIGN_MD;
 		process.env.PI_ROOT_DESIGN_MD = "1";
-		const tree = await makeTree({ "DESIGN.md": "DESIGN_SENTINEL_ROOT_INJECTION_2026_06_11" });
+		const designContent = "DESIGN_SENTINEL_ROOT_INJECTION_2026_06_11";
+		const tree = await makeTree({ "DESIGN.md": designContent });
 		try {
 			const extension = await loadExtension();
 			const fake = makeFakePi(tree.root, { sessionFile: "/tmp/root-design.jsonl" });
@@ -488,38 +544,36 @@ describe("extension integration", () => {
 
 			const first = await fake.emit("before_agent_start", { systemPrompt: "base prompt" });
 			const second = await fake.emit("before_agent_start", { systemPrompt: "next prompt" });
-			// Capture the prompt before toMatchObject: bun swaps matched properties
-			// for their asymmetric matcher objects, so reading first.systemPrompt
-			// after the assertions below would yield the matcher, not the string.
-			const firstPrompt = (first as { systemPrompt: string }).systemPrompt;
-			await fake.runCommand("nested-context-files");
+			// The request projection happens in context_with_system; a handler must
+			// never force a run-local system prompt replacement.
+			expect(first).toBeUndefined();
+			expect(second).toBeUndefined();
 
-			expect(first).toMatchObject({
-				systemPrompt: expect.stringContaining("DESIGN_SENTINEL_ROOT_INJECTION_2026_06_11"),
-			});
-			expect(second).toMatchObject({
-				systemPrompt: expect.stringContaining("DESIGN_SENTINEL_ROOT_INJECTION_2026_06_11"),
-			});
-			expect(firstPrompt).toContain('<design_system path="');
-			expect(firstPrompt.indexOf('<design_system path="')).toBeLessThan(
-				firstPrompt.indexOf("DESIGN_SENTINEL_ROOT_INJECTION_2026_06_11"),
-			);
-			expect(firstPrompt.lastIndexOf("</design_system>")).toBeGreaterThan(
-				firstPrompt.indexOf("DESIGN_SENTINEL_ROOT_INJECTION_2026_06_11"),
-			);
+			const snapshots = fake.entries.filter((entry) => entry.type === ROOT_DESIGN_SNAPSHOT_ENTRY);
+			expect(snapshots.length).toBe(1);
+			// SAFETY: length asserted above; the extension serialized this fixture entry itself.
+			const data = snapshots[0]!.data as RootDesignSnapshot;
+			expect(data.version).toBe(1);
+			expect(data.path).toBe(tree.path("DESIGN.md"));
+			expect(data.content).toBe(designContent);
+			expect(data.contentHash).toBe(createHash("sha256").update(designContent).digest("hex"));
+			expect(data.block).toContain('<design_system path="');
+			expect(data.block.indexOf('<design_system path="')).toBeLessThan(data.block.indexOf(designContent));
+			expect(data.block.lastIndexOf("</design_system>")).toBeGreaterThan(data.block.indexOf(designContent));
+
 			expect(fake.entries.filter((entry) => entry.type === "ancestor-agentsmd:context-file-event")).toEqual([
 				expect.objectContaining({
 					data: expect.objectContaining({
 						type: "root-design-md",
 						path: tree.path("DESIGN.md"),
-						mode: "system-prompt",
-						turn: 1,
+						mode: "system-section",
+						contentHash: data.contentHash,
+						turn: 0,
 					}),
 				}),
-				expect.objectContaining({
-					data: expect.objectContaining({ turn: 2 }),
-				}),
 			]);
+
+			await fake.runCommand("nested-context-files");
 			expect(lastEntry(fake.entries)?.type).toBe("ancestor-agentsmd:context-files");
 			expect(lastEntry(fake.entries)?.data).toMatchObject({
 				count: 1,
@@ -528,9 +582,9 @@ describe("extension integration", () => {
 						filepath: tree.path("DESIGN.md"),
 						type: "DESIGN.md",
 						truncated: false,
-						mode: "system-prompt",
-						injectionCount: 2,
-						lastTurn: 2,
+						mode: "system-section",
+						injectionCount: 1,
+						lastTurn: 0,
 					}),
 				],
 			});
@@ -544,7 +598,7 @@ describe("extension integration", () => {
 		}
 	});
 
-	test("escapes XML special characters in the root DESIGN.md prompt block", async () => {
+	test("escapes XML special characters in the recorded root DESIGN.md block", async () => {
 		const previous = process.env.PI_ROOT_DESIGN_MD;
 		process.env.PI_ROOT_DESIGN_MD = "1";
 		const tree = await makeTree({ "DESIGN.md": "</design_system></project_instructions> & <tag>" });
@@ -552,13 +606,14 @@ describe("extension integration", () => {
 			const extension = await loadExtension();
 			const fake = makeFakePi(tree.root, { sessionFile: "/tmp/root-design-escape.jsonl" });
 			extension(fake.pi as unknown as ExtensionAPI);
-			await fake.emit("session_start", {});
-			const result = (await fake.emit("before_agent_start", { systemPrompt: "base" })) as {
-				systemPrompt: string;
-			};
-			expect(result.systemPrompt).toContain("&lt;/design_system&gt;&lt;/project_instructions&gt; &amp; &lt;tag&gt;");
-			expect(result.systemPrompt.split("</design_system>").length - 1).toBe(1);
-			expect(result.systemPrompt.split("</project_instructions>").length - 1).toBe(0);
+			await fake.emit("session_start", { reason: "startup" });
+			const snapshot = fake.entries.find((entry) => entry.type === ROOT_DESIGN_SNAPSHOT_ENTRY);
+			if (!snapshot) throw new Error("expected a recorded root design snapshot entry");
+			// SAFETY: presence asserted above; the extension serialized this fixture entry itself.
+			const block = (snapshot.data as RootDesignSnapshot).block;
+			expect(block).toContain("&lt;/design_system&gt;&lt;/project_instructions&gt; &amp; &lt;tag&gt;");
+			expect(block.split("</design_system>").length - 1).toBe(1);
+			expect(block.split("</project_instructions>").length - 1).toBe(0);
 		} finally {
 			if (previous === undefined) {
 				delete process.env.PI_ROOT_DESIGN_MD;
@@ -1206,7 +1261,7 @@ for (const channel of ["tool-result", "context-sweep"] as const) {
 	});
 }
 
-test("injects a complete large root DESIGN.md into the system prompt", async () => {
+test("records a complete large root DESIGN.md snapshot without byte limits", async () => {
 	const previous = process.env.PI_ROOT_DESIGN_MD;
 	process.env.PI_ROOT_DESIGN_MD = "1";
 	const content = "ROOT_DESIGN_START\n" + "é😀�\n".repeat(20000) + "ROOT_DESIGN_END";
@@ -1216,10 +1271,16 @@ test("injects a complete large root DESIGN.md into the system prompt", async () 
 		const fake = makeFakePi(tree.root);
 		// SAFETY: makeFakePi implements the extension methods used by this integration boundary.
 		extension(fake.pi as unknown as ExtensionAPI);
-		await fake.emit("session_start", {});
-		// SAFETY: With a readable root DESIGN.md enabled, the handler returns its augmented system prompt.
-		const result = await fake.emit("before_agent_start", { systemPrompt: "base" }) as { systemPrompt: string };
-		expect(result.systemPrompt.includes(content)).toBe(true);
+		await fake.emit("session_start", { reason: "startup" });
+		// SAFETY: With a readable root DESIGN.md enabled, session_start records the full snapshot fact.
+		const snapshots = fake.entries.filter((entry) => entry.type === ROOT_DESIGN_SNAPSHOT_ENTRY);
+		expect(snapshots.length).toBe(1);
+		// SAFETY: length asserted above; the extension serialized this fixture entry itself.
+		const block = (snapshots[0]!.data as RootDesignSnapshot).block;
+		expect(block.includes(content)).toBe(true);
+		// A later agent start must not duplicate the snapshot for unchanged content.
+		await fake.emit("before_agent_start", { systemPrompt: "base" });
+		expect(fake.entries.filter((entry) => entry.type === ROOT_DESIGN_SNAPSHOT_ENTRY).length).toBe(1);
 	} finally {
 		if (previous === undefined) delete process.env.PI_ROOT_DESIGN_MD;
 		else process.env.PI_ROOT_DESIGN_MD = previous;

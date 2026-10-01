@@ -28,7 +28,8 @@ export function isAncestorAgentsMdEnabled() {
 	return process.env.PI_ANCESTOR_AGENTS_MD !== "0";
 }
 
-function isWithinRoot(dir: string, root: string) {
+/** True when `dir` is `root` itself or lies underneath it. Pass canonical paths. */
+export function isWithinRoot(dir: string, root: string) {
 	const relative = path.relative(root, dir);
 	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }

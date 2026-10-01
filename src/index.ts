@@ -1,6 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext, type SessionEntry, type SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { extractPathCandidates } from "./extract.js";
 import { formatInstructions, instructionHeader } from "./instructions.js";
 import {
@@ -14,6 +14,18 @@ import {
 	resolveContainedPath,
 	type AgentsFile,
 } from "./core.js";
+import {
+	decideRootDesignCapture,
+	buildEmptyRootDesignCapture,
+	injectRootDesignSection,
+	inheritParentCapture,
+	latestBranchCapture,
+	readRootDesignFile,
+	reassertRootDesignSection,
+	ROOT_DESIGN_SNAPSHOT_ENTRY,
+	type RootDesignSnapshot,
+} from "./root-design.js";
+import { payloadSystemSlots } from "./payload-system-slots.js";
 
 const COMMAND_CONTEXT_FILES = "nested-context-files";
 const FLAG_NO_CONTEXT_FILES = "no-context-files";
@@ -23,12 +35,19 @@ const SINGLETON_SESSION_KEY = "__pi_ancestor_agentsmd_singleton__";
 const SWEEP_CUSTOM_TYPE = "ancestor-agentsmd";
 const SWEEP_SCAN_MESSAGES = 40;
 const SNAPSHOT_CACHE_MAX = 64;
+/** session_start reasons that carry a restored transcript to sweep. */
+const RESTORED_TRANSCRIPT_REASONS: ReadonlySet<SessionStartEvent["reason"]> = new Set([
+	"startup",
+	"resume",
+	"fork",
+	"reload",
+]);
 
 type InjectedFileRecord = {
 	filepath: string;
 	type: "AGENTS.md" | "DESIGN.md";
 	truncated: boolean;
-	mode: "tool-result" | "context-sweep" | "system-prompt";
+	mode: "tool-result" | "context-sweep" | "system-section";
 	injectionCount: number;
 	lastTurn?: number;
 };
@@ -182,7 +201,7 @@ function rememberRootDesignInjection(state: SessionState, filepath: string) {
 		filepath: resolved,
 		type: "DESIGN.md",
 		truncated: false,
-		mode: "system-prompt",
+		mode: "system-section",
 		injectionCount: (current?.injectionCount ?? 0) + 1,
 		lastTurn: state.agentStartCount,
 	});
@@ -196,35 +215,95 @@ function appendDebugEntry(pi: ExtensionAPI, sessionKey: string, state: SessionSt
 	});
 }
 
-function appendRootDesignInjectionEvent(pi: ExtensionAPI, sessionKey: string, state: SessionState, filepath: string) {
+function appendRootDesignInjectionEvent(
+	pi: ExtensionAPI,
+	sessionKey: string,
+	state: SessionState,
+	snapshot: RootDesignSnapshot,
+) {
 	pi.appendEntry?.(ENTRY_CONTEXT_FILE_EVENT, {
 		sessionKey,
 		type: "root-design-md",
-		path: path.resolve(filepath),
-		mode: "system-prompt",
+		path: snapshot.path,
+		mode: "system-section",
+		contentHash: snapshot.contentHash,
 		turn: state.agentStartCount,
 	});
 }
 
-async function collectRootDesignPrompt(
+/** The session-lifetime capture: the last capture entry on the active branch ancestry. */
+function activeBranchCapture(ctx: { sessionManager?: { getBranch(): SessionEntry[] } }): RootDesignSnapshot | undefined {
+	return ctx.sessionManager ? latestBranchCapture(ctx.sessionManager.getBranch()) : undefined;
+}
+
+/**
+ * Record the one-time session capture if the branch ancestry has none: the
+ * readable file's value, or the empty state for a confirmed-absent file so a
+ * later file cannot silently change this session's guidance. Unreadable files
+ * freeze the empty state and report a warning. Runs through session_start,
+ * before_agent_start, and context; once an entry exists, file edits, deletion, and feature toggles never change this
+ * session — they take effect in new sessions.
+ */
+async function captureRootDesignIfNeeded(
 	pi: ExtensionAPI,
 	sessionKey: string,
+	ctx: {
+		sessionManager?: Pick<ExtensionContext["sessionManager"], "getBranch" | "getEntries" | "getHeader">;
+		ui?: { notify?(message: string, type?: string): void };
+	},
 	state: SessionState,
-	basePrompt: string,
 ) {
-	if (!isRootDesignMdEnabled()) return undefined;
-	const contained = await resolveContainedPath("DESIGN.md", state.root);
-	if (!contained) return undefined;
-
-	const designPath = path.join(contained.root, "DESIGN.md");
-	const content = await readFileContent(designPath);
-	if (!content) return undefined;
-
-	rememberRootDesignInjection(state, designPath);
-	appendRootDesignInjectionEvent(pi, sessionKey, state, designPath);
-	// Same paired block as tool-result delivery, so the system-prompt append is
-	// delimited and XML-escaped like every other injected file.
-	return basePrompt + `\n\n${formatInstructions({ filepath: designPath, content })}\n\n`;
+	// Fixed per session: the first capture wins, so return before any file
+	// access once the branch ancestry carries one. Without a session manager
+	// there is no branch to read and nowhere to persist; the root feature stays
+	// inert on such hosts.
+	if (!ctx.sessionManager) return;
+	const existing = activeBranchCapture(ctx);
+	if (existing) return;
+	const designPath = path.join(path.resolve(state.root), "DESIGN.md");
+	// Tree navigation and forks at early entries can select an ancestry that
+	// predates the capture. The session value is fixed: recover the original
+	// capture — first from the full session entries (abandoned branches
+	// included), then from the persisted parent-session chain, read-only — and
+	// append an identical copy onto the selected ancestry, so later forks and
+	// resumes retain the same frozen value. This path never rereads the design
+	// file; only a session with no recoverable lineage performs a first
+	// capture from it, and a known lineage without any capture freezes the
+	// empty state.
+	const recovered = latestBranchCapture(ctx.sessionManager.getEntries());
+	if (recovered) {
+		pi.appendEntry?.(ROOT_DESIGN_SNAPSHOT_ENTRY, recovered);
+		return;
+	}
+	const header = ctx.sessionManager.getHeader();
+	if (header?.parentSession) {
+		const inherited = await inheritParentCapture(header);
+		if (inherited) {
+			pi.appendEntry?.(ROOT_DESIGN_SNAPSHOT_ENTRY, inherited);
+			return;
+		}
+		// A missing, unreadable, or legacy parent capture cannot be reconstructed.
+		// Freeze the empty state rather than adopt today's file contents.
+		const inheritedEmpty = buildEmptyRootDesignCapture(designPath);
+		pi.appendEntry?.(ROOT_DESIGN_SNAPSHOT_ENTRY, inheritedEmpty);
+		ctx.ui?.notify?.(
+			"Could not recover the parent session's root DESIGN.md guidance; this fork runs without it. Start a new session to load the current file.",
+			"warning",
+		);
+		return;
+	}
+	const enabled = isRootDesignMdEnabled();
+	const file = enabled ? await readRootDesignFile(state.root) : { status: "missing" as const };
+	const decision = decideRootDesignCapture(existing, file, enabled, designPath);
+	if (decision.action !== "record") return;
+	pi.appendEntry?.(ROOT_DESIGN_SNAPSHOT_ENTRY, decision.capture);
+	// An empty capture freezes "no guidance" and is not a delivered file: keep
+	// it out of the injected-file debug records.
+	if (decision.capture.block !== "") {
+		rememberRootDesignInjection(state, decision.capture.path);
+		appendRootDesignInjectionEvent(pi, sessionKey, state, decision.capture);
+	}
+	if (decision.warning) ctx.ui?.notify?.(decision.warning, "warning");
 }
 
 type CollectedToolFiles = {
@@ -485,21 +564,24 @@ export default function (pi: ExtensionAPI) {
 
 	if (hasNoContextFilesFlag()) return;
 
-	pi.on("session_start", async (_event, ctx) => {
-		const event = _event as { reason?: unknown; previousSessionFile?: string | undefined };
-		clearSession(getSessionKey(ctx));
-		const state = getSessionState(getSessionKey(ctx));
+	pi.on("session_start", async (event, ctx) => {
+		const sessionKey = getSessionKey(ctx);
+		clearSession(sessionKey);
+		const state = getSessionState(sessionKey);
 		state.root = ctx.cwd;
 		state.disabled = pi.getFlag?.(FLAG_NO_CONTEXT_FILES) === true;
 		if (state.disabled) return;
+
+		// Session-lifetime capture: every start reason either finds the fixed
+		// value on the branch ancestry or records it once for this session.
+		await captureRootDesignIfNeeded(pi, sessionKey, ctx, state);
 
 		// Restored transcripts never passed through this process's
 		// tool_result handler, so deliver anything still pending once as a
 		// persistent message instead of a per-request context suffix. A new
 		// process continuing a session emits "startup", not "resume"; a fresh
 		// session yields no message entries, making the scan a no-op.
-		const reason = event.reason;
-		if (reason !== "startup" && reason !== "resume" && reason !== "fork" && reason !== "reload") return;
+		if (!RESTORED_TRANSCRIPT_REASONS.has(event.reason)) return;
 		const messages = await readRestoredMessages(ctx);
 		if (messages.length === 0) return;
 		await collectTranscriptSweepFiles(messages, state, state.root);
@@ -515,16 +597,17 @@ export default function (pi: ExtensionAPI) {
 		await snapshotToolCall(event, state);
 	});
 
-	// Root DESIGN.md injection: append to every agent-start system prompt.
-	pi.on("before_agent_start", async (event, ctx) => {
+	// Root DESIGN.md delivery: record the durable snapshot fact for every
+	// user-prompted run. The request projection happens in context_with_system;
+	// this hook never forces a system prompt, so an idle or tool continuation
+	// replaying signed thinking keeps the exact historical instruction prefix.
+	pi.on("before_agent_start", async (_event, ctx) => {
 		const sessionKey = getSessionKey(ctx);
 		const state = getSessionState(sessionKey);
 		if (state.disabled) return;
 		state.agentStartCount += 1;
-
-		let systemPrompt = await collectRootDesignPrompt(pi, sessionKey, state, event.systemPrompt);
-
-		return systemPrompt === undefined ? undefined : { systemPrompt };
+		await captureRootDesignIfNeeded(pi, sessionKey, ctx, state);
+		return undefined;
 	});
 
 	// Ancestor file injection into tool results. The trigger is generic path
@@ -563,9 +646,47 @@ export default function (pi: ExtensionAPI) {
 	pi.on("context", async (event, ctx) => {
 		const state = getSessionState(getSessionKey(ctx));
 		if (state.disabled) return;
+		// Covers capture for idle and tool continuations, which never pass
+		// through before_agent_start; a captured session never re-reads the file.
+		await captureRootDesignIfNeeded(pi, getSessionKey(ctx), ctx, state);
 		await collectTranscriptSweepFiles(event.messages, state, state.root);
 		reconcileUnconfirmedFiles(state, event.messages);
 		await flushSweptFiles(pi, state);
+	});
+
+	// Session-fixed delivery: the captured value rides as the named section of
+	// the leading system message on every request — user prompts, idle helper
+	// turns, and tool continuations alike — recomputed from the durable branch
+	// capture, so resume, fork, reload, tree navigation, and compaction all
+	// deliver the same fixed guidance without rewriting any conversation turn.
+	pi.on("context_with_system", async (event, ctx) => {
+		const state = getSessionState(getSessionKey(ctx));
+		if (state.disabled) return;
+		const captured = activeBranchCapture(ctx);
+		if (!captured || captured.block === "") return;
+		const injected = injectRootDesignSection(event.messages, captured.block);
+		return injected ? { messages: injected } : undefined;
+	});
+
+	// Payload safeguard: a foreign before_agent_start forced prompt replaces
+	// the request head after context_with_system and drops the section. Re-assert
+	// it on the final wire payload for known pi-built system-text carriers.
+	pi.on("before_provider_request", async (event, ctx) => {
+		const state = getSessionState(getSessionKey(ctx));
+		if (state.disabled) return;
+		const captured = activeBranchCapture(ctx);
+		if (!captured || captured.block === "") return undefined;
+		const slots = payloadSystemSlots(event.payload);
+		let changed = false;
+		for (const slot of slots) {
+			const text = slot.read();
+			if (text === undefined) continue;
+			const next = reassertRootDesignSection(text, captured.block);
+			if (next === undefined) continue;
+			slot.write(next);
+			changed = true;
+		}
+		return changed ? event.payload : undefined;
 	});
 
 	pi.on("session_compact", async (_event, ctx) => {
